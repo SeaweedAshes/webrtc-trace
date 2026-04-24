@@ -1,0 +1,8 @@
+src/out/
+src/.gclient_entries
+src/.gclient_previous_sync_commits
+src/.cipd/
+src/.gcs_entries
+BOOTSTRAP_REPORT.txt
+*.pyc
+__pycache__/
