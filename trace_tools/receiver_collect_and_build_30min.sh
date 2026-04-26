@@ -14,6 +14,7 @@ WAIT_TIMEOUT_SEC=900
 RECEIVER_OFFSET_MS=0
 SENDER_SSH_PORT_ON_RECEIVER=22022
 SIGNAL_SERVER_ROLE="receiver"
+RUN_DATE=""
 RUN_ID=""
 SENDER_HOST=""
 
@@ -23,6 +24,7 @@ Usage: $0 [options]
 
 Options:
   --sender-host HOST          Sender hostname or address when sender hosts signaling
+  --run-date YYYYMMDD         Shared run date directory (default: today's local date)
   --run-id ID                 Shared run id for sender/receiver scripts
   --repo-url URL              Trace repo URL (default: $REPO_URL)
   --branch NAME               Git branch (default: $BRANCH)
@@ -35,7 +37,7 @@ Options:
   --receiver-offset-ms N      Passed to build_trace_from_logs.py
   --sender-ssh-port-on-receiver N  Reverse SSH port for pulling sender logs
   --signal-server-role ROLE   sender|receiver (default: $SIGNAL_SERVER_ROLE)
-  --port N                    peerconnection_server port (default: $PORT)
+  --port N                    Signaling port for peerconnection_server/client (default: $PORT)
 EOF
   exit 1
 }
@@ -53,6 +55,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sender-host) SENDER_HOST="$2"; shift 2 ;;
+      --run-date) RUN_DATE="$2"; shift 2 ;;
       --run-id) RUN_ID="$2"; shift 2 ;;
       --repo-url) REPO_URL="$2"; shift 2 ;;
       --branch) BRANCH="$2"; shift 2 ;;
@@ -74,7 +77,12 @@ parse_args() {
   [[ "$WAIT_TIMEOUT_SEC" =~ ^[0-9]+$ ]] || die "wait-timeout-sec must be numeric"
   [[ "$RECEIVER_OFFSET_MS" =~ ^-?[0-9]+$ ]] || die "receiver-offset-ms must be numeric"
   [[ "$SENDER_SSH_PORT_ON_RECEIVER" =~ ^[0-9]+$ ]] || die "sender-ssh-port-on-receiver must be numeric"
+  [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric"
   [[ "$SIGNAL_SERVER_ROLE" =~ ^(sender|receiver)$ ]] || die "signal-server-role must be sender or receiver"
+  if [[ -z "$RUN_DATE" ]]; then
+    RUN_DATE="$(date +%Y%m%d)"
+  fi
+  [[ "$RUN_DATE" =~ ^[0-9]{8}$ ]] || die "run-date must be YYYYMMDD"
   if [[ "$SIGNAL_SERVER_ROLE" == "sender" && -z "$SENDER_HOST" ]]; then
     die "--sender-host is required when signal-server-role=sender"
   fi
@@ -118,7 +126,7 @@ pull_sender_bundle() {
       -P "$SENDER_SSH_PORT_ON_RECEIVER" \
       -o ConnectTimeout=10 \
       -o StrictHostKeyChecking=accept-new \
-      -r "localhost:trace-runs/$RUN_ID/sender/." "$sender_dir/" >/dev/null 2>&1; then
+      -r "localhost:trace-runs/$RUN_DATE/$RUN_ID/sender/." "$sender_dir/" >/dev/null 2>&1; then
       if compgen -G "$sender_dir/*.csv" > /dev/null; then
         return 0
       fi
@@ -132,20 +140,24 @@ main() {
   parse_args "$@"
   ensure_repo_and_build
 
-  mkdir -p "$LOG_ROOT" "$RUNS_ROOT/$RUN_ID"
+  local run_root="$RUNS_ROOT/$RUN_DATE/$RUN_ID"
+  mkdir -p "$LOG_ROOT" "$run_root"
 
   local src_root="$WORKDIR/src"
   local latest_dir
-  local receiver_dir="$RUNS_ROOT/$RUN_ID/receiver"
-  local sender_dir="$RUNS_ROOT/$RUN_ID/sender"
-  local trace_path="$RUNS_ROOT/$RUN_ID/generated_trace.csv"
+  local receiver_dir="$run_root/receiver"
+  local sender_dir="$run_root/sender"
+  local trace_path="$run_root/generated_trace.csv"
+  local server_log="$HOME/webrtc-server-$RUN_DATE-$RUN_ID.log"
+  local client_log="$HOME/webrtc-receiver-$RUN_DATE-$RUN_ID.log"
   local server_pid
   local client_server_host
 
   cd "$src_root"
   if [[ "$SIGNAL_SERVER_ROLE" == "receiver" ]]; then
     log "starting peerconnection_server on receiver port $PORT"
-    timeout "$((DURATION_SEC + 120))" ./out/Trace/peerconnection_server --port="$PORT" > "$HOME/webrtc-server-$RUN_ID.log" 2>&1 &
+    log "server log: $server_log"
+    timeout "$((DURATION_SEC + 120))" ./out/Trace/peerconnection_server --port="$PORT" > "$server_log" 2>&1 &
     server_pid=$!
     client_server_host="localhost"
     sleep 1
@@ -153,12 +165,13 @@ main() {
     client_server_host="$SENDER_HOST"
   fi
 
-  log "collecting receiver logs for ${DURATION_SEC}s (run_id=$RUN_ID)"
+  log "collecting receiver logs for ${DURATION_SEC}s (run_date=$RUN_DATE, run_id=$RUN_ID, server=$client_server_host, port=$PORT)"
+  log "client log: $client_log"
   timeout "$((DURATION_SEC + 120))" env WEBRTC_LOG_DIR="$LOG_ROOT" \
     xvfb-run -a ./out/Trace/peerconnection_client \
       --server="$client_server_host" \
       --port="$PORT" \
-      --autoconnect > "$HOME/webrtc-receiver-$RUN_ID.log" 2>&1 || true
+      --autoconnect > "$client_log" 2>&1 || true
 
   if [[ -n "${server_pid:-}" ]]; then
     kill "$server_pid" 2>/dev/null || true
@@ -166,7 +179,7 @@ main() {
   fi
 
   latest_dir="$(latest_log_dir "$LOG_ROOT")"
-  [[ -n "$latest_dir" ]] || die "no receiver log directory found under $LOG_ROOT"
+  [[ -n "$latest_dir" ]] || die "no receiver log directory found under $LOG_ROOT; check $client_log and $server_log"
 
   rm -rf "$receiver_dir"
   mkdir -p "$receiver_dir"
@@ -183,6 +196,7 @@ main() {
     --output "$trace_path"
 
   log "done"
+  log "  run_date=$RUN_DATE"
   log "  run_id=$RUN_ID"
   log "  receiver_bundle=$receiver_dir"
   log "  sender_bundle=$sender_dir"

@@ -12,6 +12,7 @@ PORT=8888
 DURATION_SEC=1800
 REVERSE_SSH_PORT=22022
 SIGNAL_SERVER_ROLE="receiver"
+RUN_DATE=""
 RUN_ID=""
 RECEIVER_HOST=""
 RECEIVER_USER=""
@@ -25,6 +26,7 @@ Required:
   --receiver-user USER        Receiver machine username
 
 Options:
+  --run-date YYYYMMDD         Shared run date directory (default: today's local date)
   --run-id ID                 Shared run id for sender/receiver scripts
   --repo-url URL              Trace repo URL (default: $REPO_URL)
   --branch NAME               Git branch (default: $BRANCH)
@@ -35,7 +37,7 @@ Options:
   --duration-sec N            Collection duration (default: $DURATION_SEC)
   --reverse-ssh-port N        Port exposed on receiver for pulling sender logs
   --signal-server-role ROLE   sender|receiver (default: $SIGNAL_SERVER_ROLE)
-  --port N                    peerconnection_server port (default: $PORT)
+  --port N                    Signaling port for peerconnection_server/client (default: $PORT)
 EOF
   exit 1
 }
@@ -54,6 +56,7 @@ parse_args() {
     case "$1" in
       --receiver-host) RECEIVER_HOST="$2"; shift 2 ;;
       --receiver-user) RECEIVER_USER="$2"; shift 2 ;;
+      --run-date) RUN_DATE="$2"; shift 2 ;;
       --run-id) RUN_ID="$2"; shift 2 ;;
       --repo-url) REPO_URL="$2"; shift 2 ;;
       --branch) BRANCH="$2"; shift 2 ;;
@@ -72,7 +75,12 @@ parse_args() {
   [[ -n "$RECEIVER_HOST" && -n "$RECEIVER_USER" ]] || usage
   [[ "$DURATION_SEC" =~ ^[0-9]+$ ]] || die "duration-sec must be numeric"
   [[ "$REVERSE_SSH_PORT" =~ ^[0-9]+$ ]] || die "reverse-ssh-port must be numeric"
+  [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric"
   [[ "$SIGNAL_SERVER_ROLE" =~ ^(sender|receiver)$ ]] || die "signal-server-role must be sender or receiver"
+  if [[ -z "$RUN_DATE" ]]; then
+    RUN_DATE="$(date +%Y%m%d)"
+  fi
+  [[ "$RUN_DATE" =~ ^[0-9]{8}$ ]] || die "run-date must be YYYYMMDD"
   if [[ -z "$RUN_ID" ]]; then
     RUN_ID="$(date +%Y%m%d_%H%M%S)"
   fi
@@ -116,18 +124,22 @@ main() {
   parse_args "$@"
   ensure_repo_and_build
 
-  mkdir -p "$LOG_ROOT" "$RUNS_ROOT/$RUN_ID"
+  local run_root="$RUNS_ROOT/$RUN_DATE/$RUN_ID"
+  mkdir -p "$LOG_ROOT" "$run_root"
 
   local src_root="$WORKDIR/src"
   local server_pid
   local latest_dir
-  local run_dir="$RUNS_ROOT/$RUN_ID/sender"
+  local run_dir="$run_root/sender"
+  local server_log="$HOME/webrtc-server-$RUN_DATE-$RUN_ID.log"
+  local client_log="$HOME/webrtc-sender-$RUN_DATE-$RUN_ID.log"
   local client_server_host
 
   cd "$src_root"
   if [[ "$SIGNAL_SERVER_ROLE" == "sender" ]]; then
     log "starting peerconnection_server on sender port $PORT"
-    timeout "$((DURATION_SEC + 120))" ./out/Trace/peerconnection_server --port="$PORT" > "$HOME/webrtc-server-$RUN_ID.log" 2>&1 &
+    log "server log: $server_log"
+    timeout "$((DURATION_SEC + 120))" ./out/Trace/peerconnection_server --port="$PORT" > "$server_log" 2>&1 &
     server_pid=$!
     client_server_host="localhost"
     sleep 1
@@ -137,13 +149,14 @@ main() {
 
   start_reverse_ssh_tunnel
 
-  log "collecting sender logs for ${DURATION_SEC}s (run_id=$RUN_ID)"
+  log "collecting sender logs for ${DURATION_SEC}s (run_date=$RUN_DATE, run_id=$RUN_ID, server=$client_server_host, port=$PORT)"
+  log "client log: $client_log"
   timeout "$((DURATION_SEC + 120))" env WEBRTC_LOG_DIR="$LOG_ROOT" \
     xvfb-run -a ./out/Trace/peerconnection_client \
       --server="$client_server_host" \
       --port="$PORT" \
       --autoconnect \
-      --autocall > "$HOME/webrtc-sender-$RUN_ID.log" 2>&1 || true
+      --autocall > "$client_log" 2>&1 || true
 
   if [[ -n "${server_pid:-}" ]]; then
     kill "$server_pid" 2>/dev/null || true
@@ -151,7 +164,7 @@ main() {
   fi
 
   latest_dir="$(latest_log_dir "$LOG_ROOT")"
-  [[ -n "$latest_dir" ]] || die "no sender log directory found under $LOG_ROOT"
+  [[ -n "$latest_dir" ]] || die "no sender log directory found under $LOG_ROOT; check $client_log and $server_log"
 
   rm -rf "$run_dir"
   mkdir -p "$run_dir"
@@ -162,12 +175,16 @@ receiver_host=$RECEIVER_HOST
 receiver_user=$RECEIVER_USER
 reverse_ssh_port=$REVERSE_SSH_PORT
 signal_server_role=$SIGNAL_SERVER_ROLE
+run_date=$RUN_DATE
+run_id=$RUN_ID
+port=$PORT
 EOF
 
   log "done"
+  log "  run_date=$RUN_DATE"
   log "  run_id=$RUN_ID"
   log "  local_sender_bundle=$run_dir"
-  log "  receiver pulls via: scp -P $REVERSE_SSH_PORT localhost:trace-runs/$RUN_ID/sender/..."
+  log "  receiver pulls via: scp -P $REVERSE_SSH_PORT localhost:trace-runs/$RUN_DATE/$RUN_ID/sender/..."
 }
 
 main "$@"
