@@ -11,6 +11,8 @@ RUNS_ROOT="$HOME/trace-runs"
 PORT=8888
 DURATION_SEC=1800
 DURATION_MIN=""
+RECEIVER_SSH_PORT=22
+SENDER_LOCAL_SSH_PORT=22
 REVERSE_SSH_PORT=22022
 SIGNAL_SERVER_ROLE="receiver"
 RUN_DATE=""
@@ -37,6 +39,8 @@ Options:
   --runs-root PATH            Local run bundle root (default: $RUNS_ROOT)
   --duration-sec N            Collection duration (default: $DURATION_SEC)
   --duration-min N            Collection duration in minutes
+  --receiver-ssh-port N       Receiver SSH port used for reverse tunnel setup
+  --sender-local-ssh-port N   Sender local SSH port exported through reverse tunnel
   --reverse-ssh-port N        Port exposed on receiver for pulling sender logs
   --signal-server-role ROLE   sender|receiver (default: $SIGNAL_SERVER_ROLE)
   --port N                    Signaling port for peerconnection_server/client (default: $PORT)
@@ -68,6 +72,8 @@ parse_args() {
       --runs-root) RUNS_ROOT="$2"; shift 2 ;;
       --duration-sec) DURATION_SEC="$2"; shift 2 ;;
       --duration-min) DURATION_MIN="$2"; shift 2 ;;
+      --receiver-ssh-port) RECEIVER_SSH_PORT="$2"; shift 2 ;;
+      --sender-local-ssh-port) SENDER_LOCAL_SSH_PORT="$2"; shift 2 ;;
       --reverse-ssh-port) REVERSE_SSH_PORT="$2"; shift 2 ;;
       --signal-server-role) SIGNAL_SERVER_ROLE="$2"; shift 2 ;;
       --port) PORT="$2"; shift 2 ;;
@@ -82,6 +88,8 @@ parse_args() {
   fi
   [[ "$DURATION_SEC" =~ ^[0-9]+$ ]] || die "duration-sec must be numeric"
   (( DURATION_SEC > 0 )) || die "duration must be greater than zero"
+  [[ "$RECEIVER_SSH_PORT" =~ ^[0-9]+$ ]] || die "receiver-ssh-port must be numeric"
+  [[ "$SENDER_LOCAL_SSH_PORT" =~ ^[0-9]+$ ]] || die "sender-local-ssh-port must be numeric"
   [[ "$REVERSE_SSH_PORT" =~ ^[0-9]+$ ]] || die "reverse-ssh-port must be numeric"
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric"
   [[ "$SIGNAL_SERVER_ROLE" =~ ^(sender|receiver)$ ]] || die "signal-server-role must be sender or receiver"
@@ -118,13 +126,14 @@ latest_log_dir() {
 }
 
 start_reverse_ssh_tunnel() {
-  log "opening reverse SSH tunnel on receiver port $REVERSE_SSH_PORT"
+  log "opening reverse SSH tunnel via ${RECEIVER_HOST}:${RECEIVER_SSH_PORT} -> receiver local port $REVERSE_SSH_PORT -> sender local SSH port $SENDER_LOCAL_SSH_PORT"
   ssh -fNT \
+    -p "$RECEIVER_SSH_PORT" \
     -o ExitOnForwardFailure=yes \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
     -o StrictHostKeyChecking=accept-new \
-    -R "${REVERSE_SSH_PORT}:localhost:22" \
+    -R "${REVERSE_SSH_PORT}:localhost:${SENDER_LOCAL_SSH_PORT}" \
     "${RECEIVER_USER}@${RECEIVER_HOST}"
 }
 
@@ -181,6 +190,8 @@ main() {
   cat > "$run_dir/TUNNEL_INFO.txt" <<EOF
 receiver_host=$RECEIVER_HOST
 receiver_user=$RECEIVER_USER
+receiver_ssh_port=$RECEIVER_SSH_PORT
+sender_local_ssh_port=$SENDER_LOCAL_SSH_PORT
 reverse_ssh_port=$REVERSE_SSH_PORT
 signal_server_role=$SIGNAL_SERVER_ROLE
 run_date=$RUN_DATE
