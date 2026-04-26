@@ -19,8 +19,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-ms", type=int, default=50)
     parser.add_argument("--base-delay-percentile", type=float, default=5.0)
     parser.add_argument(
+        "--delay-source",
+        choices=("feedback", "receiver-arrival"),
+        default="feedback",
+        help=(
+            "feedback=sender packet_feedback delay, "
+            "receiver-arrival=match sender rtp_send seq_num to receiver packet_buffer_inserts"
+        ),
+    )
+    parser.add_argument(
         "--rate-source",
-        choices=("auto", "acked", "bwe", "send"),
+        choices=("auto", "none", "acked", "bwe", "send"),
         default="auto",
         help="acked=packet_feedback, bwe=bwe_target, send=rtp_send",
     )
@@ -31,6 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-rate-kbit", type=int, default=150)
     parser.add_argument("--loss-quantum-pct", type=float, default=0.5)
     parser.add_argument("--max-loss-pct", type=float, default=30.0)
+    parser.add_argument(
+        "--disable-loss",
+        action="store_true",
+        help="do not emit inferred loss_pct values",
+    )
     parser.add_argument("--limit-pkts", type=int, default=1000)
     parser.add_argument(
         "--receiver-time-offset-ms",
@@ -117,6 +131,18 @@ def resolve_origin_ms(
     return min(candidates)
 
 
+def receiver_arrival_origin_ms(receiver_packet_rows: list[dict[str, str]]) -> int:
+    candidates = [
+        ts
+        for row in receiver_packet_rows
+        for ts in [as_int(row, "timestamp_ms")]
+        if ts is not None
+    ]
+    if not candidates:
+        raise ValueError("no receiver packet insert timestamps found")
+    return min(candidates)
+
+
 def build_trace() -> int:
     args = parse_args()
     sender_dir = args.sender_log_dir
@@ -134,9 +160,25 @@ def build_trace() -> int:
     packet_feedback_rows = read_rows(sender_paths["packet_feedback"])
     bwe_rows = read_rows(sender_paths["bwe_target"])
     send_rows = read_rows(sender_paths["rtp_send"])
+    receiver_packet_rows = (
+        read_rows(receiver_dir / "packet_buffer_inserts.csv")
+        if receiver_dir
+        else []
+    )
 
     rate_source = pick_rate_source(args, sender_paths)
-    origin_ms = resolve_origin_ms(packet_feedback_rows, bwe_rows, send_rows)
+    if args.delay_source == "receiver-arrival":
+        if not receiver_dir:
+            raise ValueError("--delay-source receiver-arrival requires --receiver-log-dir")
+        if args.rate_source != "auto" and rate_source != "none":
+            raise ValueError(
+                "--delay-source receiver-arrival currently requires --rate-source none"
+            )
+        rate_source = "none"
+        args.disable_loss = True
+        origin_ms = receiver_arrival_origin_ms(receiver_packet_rows)
+    else:
+        origin_ms = resolve_origin_ms(packet_feedback_rows, bwe_rows, send_rows)
     window_ms = args.window_ms
 
     delay_bins: dict[int, list[float]] = defaultdict(list)
@@ -149,6 +191,52 @@ def build_trace() -> int:
     note_bins: dict[int, list[str]] = defaultdict(list)
     all_delay_samples: list[float] = []
 
+    if args.delay_source == "feedback":
+        for row in packet_feedback_rows:
+            send_time = as_int(row, "send_time_ms")
+            recv_time = as_int(row, "recv_time_ms")
+            size_bytes = as_int(row, "size_bytes")
+            if send_time is None or recv_time is None or size_bytes is None:
+                continue
+            if recv_time < send_time:
+                continue
+            idx = max(0, (recv_time - origin_ms) // window_ms)
+            send_idx = max(0, (send_time - origin_ms) // window_ms)
+            sample_delay = float(recv_time - send_time)
+            all_delay_samples.append(sample_delay)
+            delay_bins[idx].append(sample_delay)
+            acked_bins[idx] += size_bytes
+            acked_send_bins[send_idx] += size_bytes
+    else:
+        send_time_by_seq: dict[int, int] = {}
+        for row in send_rows:
+            if row.get("is_audio") not in ("", "0"):
+                continue
+            seq_num = as_int(row, "seq_num")
+            send_time = as_int(row, "send_time_ms")
+            if seq_num is None or send_time is None:
+                continue
+            send_time_by_seq.setdefault(seq_num, send_time)
+
+        matched_packets = 0
+        for row in receiver_packet_rows:
+            seq_num = as_int(row, "seq_num")
+            recv_time = as_int(row, "timestamp_ms")
+            if seq_num is None or recv_time is None:
+                continue
+            send_time = send_time_by_seq.get(seq_num)
+            if send_time is None:
+                continue
+            idx = max(0, (recv_time - origin_ms) // window_ms)
+            sample_delay = float(recv_time - send_time)
+            all_delay_samples.append(sample_delay)
+            delay_bins[idx].append(sample_delay)
+            matched_packets += 1
+        if matched_packets == 0:
+            raise ValueError(
+                "receiver-arrival delay source found no matching seq_num rows"
+            )
+
     for row in packet_feedback_rows:
         send_time = as_int(row, "send_time_ms")
         recv_time = as_int(row, "recv_time_ms")
@@ -159,9 +247,6 @@ def build_trace() -> int:
             continue
         idx = max(0, (recv_time - origin_ms) // window_ms)
         send_idx = max(0, (send_time - origin_ms) // window_ms)
-        sample_delay = float(recv_time - send_time)
-        all_delay_samples.append(sample_delay)
-        delay_bins[idx].append(sample_delay)
         acked_bins[idx] += size_bytes
         acked_send_bins[send_idx] += size_bytes
 
@@ -193,13 +278,14 @@ def build_trace() -> int:
         idx = max(0, (ts - origin_ms) // window_ms)
         send_bins[idx] += payload_size
 
-    for idx, sent_bytes in send_bins.items():
-        if sent_bytes <= 0:
-            continue
-        delivered_bytes = acked_send_bins.get(idx, 0)
-        raw_loss = max(0.0, 1.0 - (delivered_bytes / float(sent_bytes)))
-        loss_pct = min(args.max_loss_pct, raw_loss * 100.0)
-        loss_bins[idx] = loss_pct
+    if not args.disable_loss:
+        for idx, sent_bytes in send_bins.items():
+            if sent_bytes <= 0:
+                continue
+            delivered_bytes = acked_send_bins.get(idx, 0)
+            raw_loss = max(0.0, 1.0 - (delivered_bytes / float(sent_bytes)))
+            loss_pct = min(args.max_loss_pct, raw_loss * 100.0)
+            loss_bins[idx] = loss_pct
 
     if receiver_dir:
         freeze_rows = read_rows(receiver_dir / "video_freeze.csv")
@@ -242,7 +328,9 @@ def build_trace() -> int:
             previous_loss = loss_bins[idx]
 
         current_rate: float | None = previous_rate
-        if rate_source == "acked":
+        if rate_source == "none":
+            current_rate = None
+        elif rate_source == "acked":
             if idx in acked_bins:
                 current_rate = (acked_bins[idx] * 8.0 / window_ms) * args.rate_headroom
         elif rate_source == "bwe":

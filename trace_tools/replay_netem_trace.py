@@ -39,6 +39,11 @@ def parse_args() -> argparse.Namespace:
         help="restore zero-delay baseline after the last event",
     )
     parser.add_argument(
+        "--sudo",
+        action="store_true",
+        help="prefix tc/ip commands with `sudo -n`",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print commands without executing them",
@@ -69,23 +74,32 @@ def read_trace(path: Path) -> list[dict[str, str]]:
     return parsed
 
 
-def tc_prefix(namespace: str | None) -> list[str]:
+def tc_prefix(namespace: str | None, use_sudo: bool) -> list[str]:
+    prefix = ["sudo", "-n"] if use_sudo else []
     if namespace:
-        return ["ip", "netns", "exec", namespace, "tc"]
-    return ["tc"]
+        return prefix + ["ip", "netns", "exec", namespace, "tc"]
+    return prefix + ["tc"]
 
 
 def build_tc_cmd(
     namespace: str | None,
     iface: str,
     *,
+    use_sudo: bool,
     delay_ms: int,
     jitter_ms: int,
     loss_pct: float,
     rate_kbit: str,
     limit_pkts: str,
 ) -> list[str]:
-    cmd = tc_prefix(namespace) + ["qdisc", "replace", "dev", iface, "root", "netem"]
+    cmd = tc_prefix(namespace, use_sudo) + [
+        "qdisc",
+        "replace",
+        "dev",
+        iface,
+        "root",
+        "netem",
+    ]
     if limit_pkts:
         cmd += ["limit", limit_pkts]
     if jitter_ms:
@@ -117,6 +131,7 @@ def apply_row(args: argparse.Namespace, row: dict[str, str]) -> None:
     cmd = build_tc_cmd(
         args.namespace,
         args.iface,
+        use_sudo=args.sudo,
         delay_ms=delay_ms,
         jitter_ms=jitter_ms,
         loss_pct=loss_pct,

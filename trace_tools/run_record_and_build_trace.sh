@@ -219,8 +219,9 @@ sleep 0.3
 
 if [[ -n "$RECORD_TRACE" ]]; then
   PG_TRACE=$(start_pg "$RUN_DIR/trace_replay.log" \
-    python3 "$TRACE_REPLAY_TOOL" --trace "$RECORD_TRACE" --namespace "$NS_SEND" --iface "$VETH_SEND" --reset-at-end)
+    python3 "$TRACE_REPLAY_TOOL" --trace "$RECORD_TRACE" --namespace "$NS_SEND" --iface "$VETH_SEND" --sudo --reset-at-end)
   sleep 0.2
+  kill -0 "$PG_TRACE" 2>/dev/null || fail "trace replay failed; check $RUN_DIR/trace_replay.log"
 fi
 
 if [[ "$DURATION_SEC" -gt 0 ]]; then

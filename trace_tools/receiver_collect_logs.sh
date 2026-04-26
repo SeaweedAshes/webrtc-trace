@@ -139,7 +139,7 @@ main() {
 
   log "collecting receiver logs for ${DURATION_SEC}s (run_date=$RUN_DATE, run_id=$RUN_ID, server=$client_server_host, port=$PORT)"
   log "client log: $client_log"
-  timeout "$((DURATION_SEC + 120))" env WEBRTC_LOG_DIR="$LOG_ROOT" \
+  timeout "$DURATION_SEC" env WEBRTC_LOG_DIR="$LOG_ROOT" \
     xvfb-run -a ./out/Trace/peerconnection_client \
       --server="$client_server_host" \
       --port="$PORT" \
