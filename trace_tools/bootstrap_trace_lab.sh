@@ -79,6 +79,12 @@ find_non_depot_ninja() {
       *) printf '%s\n' "$ninja_path"; return 0 ;;
     esac
   done < <(type -a -p ninja 2>/dev/null || true)
+  for ninja_path in /usr/bin/ninja /bin/ninja /usr/local/bin/ninja; do
+    if [[ -x "$ninja_path" ]]; then
+      printf '%s\n' "$ninja_path"
+      return 0
+    fi
+  done
   return 1
 }
 
