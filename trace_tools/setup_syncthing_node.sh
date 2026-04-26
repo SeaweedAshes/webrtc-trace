@@ -124,16 +124,26 @@ EOF
 start_service() {
   if command -v systemctl >/dev/null 2>&1; then
     write_user_service
-    systemctl --user daemon-reload
-    systemctl --user enable --now "$SERVICE_NAME.service"
-    systemctl --user restart "$SERVICE_NAME.service"
-  else
-    nohup "$(command -v syncthing)" --home="$ST_HOME" --no-browser --no-restart --gui-address="127.0.0.1:$GUI_PORT" >/tmp/"$SERVICE_NAME".log 2>&1 &
+    if systemctl --user daemon-reload \
+      && systemctl --user enable --now "$SERVICE_NAME.service" \
+      && systemctl --user restart "$SERVICE_NAME.service"; then
+      log "started Syncthing via systemd user service"
+      return
+    fi
+    log "systemd user service start failed; falling back to background launch"
   fi
+
+  nohup "$(command -v syncthing)" \
+    --home="$ST_HOME" \
+    --no-browser \
+    --no-restart \
+    --gui-address="127.0.0.1:$GUI_PORT" \
+    >"$HOME/${SERVICE_NAME}.log" 2>&1 &
+  log "started Syncthing in background; log=$HOME/${SERVICE_NAME}.log"
 }
 
 wait_for_api() {
-  local deadline=$((SECONDS + 30))
+  local deadline=$((SECONDS + 60))
   while (( SECONDS < deadline )); do
     if curl -fsS "http://127.0.0.1:$GUI_PORT/rest/noauth/health" >/dev/null 2>&1; then
       return 0
@@ -165,7 +175,7 @@ main() {
   [[ -n "$API_KEY" ]] || die "failed to read Syncthing API key from $ST_HOME/config.xml"
 
   start_service
-  wait_for_api || die "Syncthing API did not become ready on 127.0.0.1:$GUI_PORT"
+  wait_for_api || die "Syncthing API did not become ready on 127.0.0.1:$GUI_PORT; check systemctl --user status $SERVICE_NAME.service or $HOME/${SERVICE_NAME}.log"
 
   log "ready"
   log "  device_id=$(local_device_id)"
