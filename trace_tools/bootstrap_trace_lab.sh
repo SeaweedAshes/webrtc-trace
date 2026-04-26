@@ -312,13 +312,14 @@ ensure_gn_gen() {
   local src_root="$1"
   local out_dir="$src_root/$BUILD_DIR"
   local args_file="$out_dir/args.gn"
+  local build_ninja="$out_dir/build.ninja"
   local gn_args_tmp
 
   mkdir -p "$out_dir"
   gn_args_tmp="$(mktemp)"
   printf '%s\n' "$GN_ARGS_TEXT" > "$gn_args_tmp"
 
-  if [[ "$FORCE_GN_GEN" -eq 1 || ! -f "$args_file" ]] || ! cmp -s "$gn_args_tmp" "$args_file"; then
+  if [[ "$FORCE_GN_GEN" -eq 1 || ! -f "$args_file" || ! -f "$build_ninja" ]] || ! cmp -s "$gn_args_tmp" "$args_file"; then
     cp "$gn_args_tmp" "$args_file"
     log "running gn gen $BUILD_DIR"
     (

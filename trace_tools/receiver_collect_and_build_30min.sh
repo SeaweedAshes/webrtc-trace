@@ -13,11 +13,11 @@ DURATION_SEC=1800
 DURATION_MIN=""
 WAIT_TIMEOUT_SEC=900
 RECEIVER_OFFSET_MS=0
-SENDER_SSH_PORT_ON_RECEIVER=22022
 SIGNAL_SERVER_ROLE="receiver"
 RUN_DATE=""
 RUN_ID=""
 SENDER_HOST=""
+SENDER_LOG_DIR=""
 
 usage() {
   cat <<EOF
@@ -33,11 +33,11 @@ Options:
   --workdir PATH              Bootstrap workdir (default: $WORKDIR)
   --log-root PATH             Receiver log root (default: $LOG_ROOT)
   --runs-root PATH            Run bundle root (default: $RUNS_ROOT)
+  --sender-log-dir PATH       Existing sender bundle directory to use for trace build
   --duration-sec N            Collection duration (default: $DURATION_SEC)
   --duration-min N            Collection duration in minutes
-  --wait-timeout-sec N        Wait time for sender bundle (default: $WAIT_TIMEOUT_SEC)
+  --wait-timeout-sec N        Wait time for manual sender bundle copy (default: $WAIT_TIMEOUT_SEC)
   --receiver-offset-ms N      Passed to build_trace_from_logs.py
-  --sender-ssh-port-on-receiver N  Reverse SSH port for pulling sender logs
   --signal-server-role ROLE   sender|receiver (default: $SIGNAL_SERVER_ROLE)
   --port N                    Signaling port for peerconnection_server/client (default: $PORT)
 EOF
@@ -65,11 +65,11 @@ parse_args() {
       --workdir) WORKDIR="$2"; shift 2 ;;
       --log-root) LOG_ROOT="$2"; shift 2 ;;
       --runs-root) RUNS_ROOT="$2"; shift 2 ;;
+      --sender-log-dir) SENDER_LOG_DIR="$2"; shift 2 ;;
       --duration-sec) DURATION_SEC="$2"; shift 2 ;;
       --duration-min) DURATION_MIN="$2"; shift 2 ;;
       --wait-timeout-sec) WAIT_TIMEOUT_SEC="$2"; shift 2 ;;
       --receiver-offset-ms) RECEIVER_OFFSET_MS="$2"; shift 2 ;;
-      --sender-ssh-port-on-receiver) SENDER_SSH_PORT_ON_RECEIVER="$2"; shift 2 ;;
       --signal-server-role) SIGNAL_SERVER_ROLE="$2"; shift 2 ;;
       --port) PORT="$2"; shift 2 ;;
       *) usage ;;
@@ -84,7 +84,6 @@ parse_args() {
   (( DURATION_SEC > 0 )) || die "duration must be greater than zero"
   [[ "$WAIT_TIMEOUT_SEC" =~ ^[0-9]+$ ]] || die "wait-timeout-sec must be numeric"
   [[ "$RECEIVER_OFFSET_MS" =~ ^-?[0-9]+$ ]] || die "receiver-offset-ms must be numeric"
-  [[ "$SENDER_SSH_PORT_ON_RECEIVER" =~ ^[0-9]+$ ]] || die "sender-ssh-port-on-receiver must be numeric"
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric"
   [[ "$SIGNAL_SERVER_ROLE" =~ ^(sender|receiver)$ ]] || die "signal-server-role must be sender or receiver"
   if [[ -z "$RUN_DATE" ]]; then
@@ -122,22 +121,12 @@ latest_log_dir() {
   find "$1" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1
 }
 
-pull_sender_bundle() {
+wait_for_sender_bundle() {
   local sender_dir="$1"
   local deadline=$((SECONDS + WAIT_TIMEOUT_SEC))
-  rm -rf "$sender_dir"
-  mkdir -p "$sender_dir"
   while (( SECONDS < deadline )); do
-    rm -rf "$sender_dir"
-    mkdir -p "$sender_dir"
-    if scp \
-      -P "$SENDER_SSH_PORT_ON_RECEIVER" \
-      -o ConnectTimeout=10 \
-      -o StrictHostKeyChecking=accept-new \
-      -r "localhost:trace-runs/$RUN_DATE/$RUN_ID/sender/." "$sender_dir/" >/dev/null 2>&1; then
-      if compgen -G "$sender_dir/*.csv" > /dev/null; then
-        return 0
-      fi
+    if compgen -G "$sender_dir/*.csv" > /dev/null; then
+      return 0
     fi
     sleep 10
   done
@@ -193,8 +182,17 @@ main() {
   mkdir -p "$receiver_dir"
   cp -a "$latest_dir/." "$receiver_dir/"
 
-  log "pulling sender bundle via reverse SSH port $SENDER_SSH_PORT_ON_RECEIVER"
-  pull_sender_bundle "$sender_dir" || die "failed to pull sender bundle within ${WAIT_TIMEOUT_SEC}s"
+  rm -rf "$sender_dir"
+  mkdir -p "$sender_dir"
+  if [[ -n "$SENDER_LOG_DIR" ]]; then
+    [[ -d "$SENDER_LOG_DIR" ]] || die "sender-log-dir does not exist: $SENDER_LOG_DIR"
+    cp -a "$SENDER_LOG_DIR/." "$sender_dir/"
+  fi
+
+  if ! compgen -G "$sender_dir/*.csv" > /dev/null; then
+    log "waiting for sender bundle copy into $sender_dir"
+    wait_for_sender_bundle "$sender_dir" || die "no sender bundle found in $sender_dir within ${WAIT_TIMEOUT_SEC}s; copy sender logs there or use --sender-log-dir"
+  fi
 
   log "building trace"
   python3 "$REPO_DIR/trace_tools/build_trace_from_logs.py" \

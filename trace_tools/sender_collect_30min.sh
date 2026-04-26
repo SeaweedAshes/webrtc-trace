@@ -22,13 +22,11 @@ RECEIVER_USER=""
 
 usage() {
   cat <<EOF
-Usage: $0 --receiver-host HOST --receiver-user USER [options]
-
-Required:
-  --receiver-host HOST        Receiver machine IP or hostname
-  --receiver-user USER        Receiver machine username
+Usage: $0 [options]
 
 Options:
+  --receiver-host HOST        Receiver machine IP or hostname when receiver hosts signaling
+  --receiver-user USER        Ignored in local-copy mode; kept for backward compatibility
   --run-date YYYYMMDD         Shared run date directory (default: today's local date)
   --run-id ID                 Shared run id for sender/receiver scripts
   --repo-url URL              Trace repo URL (default: $REPO_URL)
@@ -39,9 +37,9 @@ Options:
   --runs-root PATH            Local run bundle root (default: $RUNS_ROOT)
   --duration-sec N            Collection duration (default: $DURATION_SEC)
   --duration-min N            Collection duration in minutes
-  --receiver-ssh-port N       Receiver SSH port used for reverse tunnel setup
-  --sender-local-ssh-port N   Sender local SSH port exported through reverse tunnel
-  --reverse-ssh-port N        Port exposed on receiver for pulling sender logs
+  --receiver-ssh-port N       Ignored in local-copy mode; kept for backward compatibility
+  --sender-local-ssh-port N   Ignored in local-copy mode; kept for backward compatibility
+  --reverse-ssh-port N        Ignored in local-copy mode; kept for backward compatibility
   --signal-server-role ROLE   sender|receiver (default: $SIGNAL_SERVER_ROLE)
   --port N                    Signaling port for peerconnection_server/client (default: $PORT)
 EOF
@@ -81,7 +79,6 @@ parse_args() {
     esac
   done
 
-  [[ -n "$RECEIVER_HOST" && -n "$RECEIVER_USER" ]] || usage
   if [[ -n "$DURATION_MIN" ]]; then
     [[ "$DURATION_MIN" =~ ^[0-9]+$ ]] || die "duration-min must be numeric"
     DURATION_SEC="$((DURATION_MIN * 60))"
@@ -93,6 +90,9 @@ parse_args() {
   [[ "$REVERSE_SSH_PORT" =~ ^[0-9]+$ ]] || die "reverse-ssh-port must be numeric"
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric"
   [[ "$SIGNAL_SERVER_ROLE" =~ ^(sender|receiver)$ ]] || die "signal-server-role must be sender or receiver"
+  if [[ "$SIGNAL_SERVER_ROLE" == "receiver" && -z "$RECEIVER_HOST" ]]; then
+    die "--receiver-host is required when signal-server-role=receiver"
+  fi
   if [[ -z "$RUN_DATE" ]]; then
     RUN_DATE="$(date +%Y%m%d)"
   fi
@@ -125,18 +125,6 @@ latest_log_dir() {
   find "$1" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1
 }
 
-start_reverse_ssh_tunnel() {
-  log "opening reverse SSH tunnel via ${RECEIVER_HOST}:${RECEIVER_SSH_PORT} -> receiver local port $REVERSE_SSH_PORT -> sender local SSH port $SENDER_LOCAL_SSH_PORT"
-  ssh -fNT \
-    -p "$RECEIVER_SSH_PORT" \
-    -o ExitOnForwardFailure=yes \
-    -o ServerAliveInterval=30 \
-    -o ServerAliveCountMax=3 \
-    -o StrictHostKeyChecking=accept-new \
-    -R "${REVERSE_SSH_PORT}:localhost:${SENDER_LOCAL_SSH_PORT}" \
-    "${RECEIVER_USER}@${RECEIVER_HOST}"
-}
-
 main() {
   parse_args "$@"
   ensure_repo_and_build
@@ -164,8 +152,6 @@ main() {
     client_server_host="$RECEIVER_HOST"
   fi
 
-  start_reverse_ssh_tunnel
-
   log "collecting sender logs for ${DURATION_SEC}s (run_date=$RUN_DATE, run_id=$RUN_ID, server=$client_server_host, port=$PORT)"
   log "client log: $client_log"
   timeout "$((DURATION_SEC + 120))" env WEBRTC_LOG_DIR="$LOG_ROOT" \
@@ -187,7 +173,7 @@ main() {
   mkdir -p "$run_dir"
   cp -a "$latest_dir/." "$run_dir/"
 
-  cat > "$run_dir/TUNNEL_INFO.txt" <<EOF
+  cat > "$run_dir/COLLECT_INFO.txt" <<EOF
 receiver_host=$RECEIVER_HOST
 receiver_user=$RECEIVER_USER
 receiver_ssh_port=$RECEIVER_SSH_PORT
@@ -203,7 +189,7 @@ EOF
   log "  run_date=$RUN_DATE"
   log "  run_id=$RUN_ID"
   log "  local_sender_bundle=$run_dir"
-  log "  receiver pulls via: scp -P $REVERSE_SSH_PORT localhost:trace-runs/$RUN_DATE/$RUN_ID/sender/..."
+  log "  copy this sender bundle to receiver: $run_dir"
 }
 
 main "$@"
