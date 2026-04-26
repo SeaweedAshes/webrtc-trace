@@ -8,7 +8,7 @@ import csv
 import math
 from collections import defaultdict
 from pathlib import Path
-from statistics import median
+from statistics import median, pstdev
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sender-log-dir", required=True, type=Path)
     parser.add_argument("--receiver-log-dir", type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--window-ms", type=int, default=100)
+    parser.add_argument("--window-ms", type=int, default=50)
     parser.add_argument("--base-delay-percentile", type=float, default=5.0)
     parser.add_argument(
         "--rate-source",
@@ -26,8 +26,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rate-headroom", type=float, default=1.05)
     parser.add_argument("--delay-quantum-ms", type=int, default=5)
+    parser.add_argument("--jitter-quantum-ms", type=int, default=5)
     parser.add_argument("--rate-quantum-kbit", type=int, default=50)
     parser.add_argument("--min-rate-kbit", type=int, default=150)
+    parser.add_argument("--loss-quantum-pct", type=float, default=0.5)
+    parser.add_argument("--max-loss-pct", type=float, default=30.0)
     parser.add_argument("--limit-pkts", type=int, default=1000)
     parser.add_argument(
         "--receiver-time-offset-ms",
@@ -56,6 +59,12 @@ def quantize(value: float, quantum: int) -> int:
     if quantum <= 1:
         return int(round(value))
     return int(round(value / quantum) * quantum)
+
+
+def quantize_float(value: float, quantum: float) -> float:
+    if quantum <= 0:
+        return value
+    return round(round(value / quantum) * quantum, 3)
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -132,8 +141,11 @@ def build_trace() -> int:
 
     delay_bins: dict[int, list[float]] = defaultdict(list)
     acked_bins: dict[int, int] = defaultdict(int)
+    acked_send_bins: dict[int, int] = defaultdict(int)
     bwe_bins: dict[int, list[float]] = defaultdict(list)
     send_bins: dict[int, int] = defaultdict(int)
+    jitter_bins: dict[int, list[float]] = defaultdict(list)
+    loss_bins: dict[int, float] = {}
     note_bins: dict[int, list[str]] = defaultdict(list)
     all_delay_samples: list[float] = []
 
@@ -146,10 +158,12 @@ def build_trace() -> int:
         if recv_time < send_time:
             continue
         idx = max(0, (recv_time - origin_ms) // window_ms)
+        send_idx = max(0, (send_time - origin_ms) // window_ms)
         sample_delay = float(recv_time - send_time)
         all_delay_samples.append(sample_delay)
         delay_bins[idx].append(sample_delay)
         acked_bins[idx] += size_bytes
+        acked_send_bins[send_idx] += size_bytes
 
     base_delay_ms = (
         percentile(all_delay_samples, args.base_delay_percentile)
@@ -158,7 +172,10 @@ def build_trace() -> int:
     )
     if all_delay_samples:
         for idx, samples in list(delay_bins.items()):
-            delay_bins[idx] = [max(0.0, sample - base_delay_ms) for sample in samples]
+            adjusted = [max(0.0, sample - base_delay_ms) for sample in samples]
+            delay_bins[idx] = adjusted
+            if len(adjusted) > 1:
+                jitter_bins[idx] = adjusted
 
     for row in bwe_rows:
         ts = as_int(row, "timestamp_ms")
@@ -175,6 +192,14 @@ def build_trace() -> int:
             continue
         idx = max(0, (ts - origin_ms) // window_ms)
         send_bins[idx] += payload_size
+
+    for idx, sent_bytes in send_bins.items():
+        if sent_bytes <= 0:
+            continue
+        delivered_bytes = acked_send_bins.get(idx, 0)
+        raw_loss = max(0.0, 1.0 - (delivered_bytes / float(sent_bytes)))
+        loss_pct = min(args.max_loss_pct, raw_loss * 100.0)
+        loss_bins[idx] = loss_pct
 
     if receiver_dir:
         freeze_rows = read_rows(receiver_dir / "video_freeze.csv")
@@ -197,18 +222,24 @@ def build_trace() -> int:
                 note_bins[idx].append(f"freeze:{duration}ms")
 
     max_bin = 0
-    for bucket in (delay_bins, acked_bins, bwe_bins, send_bins, note_bins):
+    for bucket in (delay_bins, acked_bins, acked_send_bins, bwe_bins, send_bins, jitter_bins, loss_bins, note_bins):
         if bucket:
             max_bin = max(max_bin, max(bucket))
 
     rows: list[dict[str, str]] = []
     previous_delay = 0.0
+    previous_jitter = 0.0
+    previous_loss = 0.0
     previous_rate: float | None = None
-    previous_state: tuple[int, str, str] | None = None
+    previous_state: tuple[int, int, str, str, str] | None = None
 
     for idx in range(max_bin + 1):
         if idx in delay_bins and delay_bins[idx]:
             previous_delay = float(median(delay_bins[idx]))
+        if idx in jitter_bins and jitter_bins[idx]:
+            previous_jitter = pstdev(jitter_bins[idx]) if len(jitter_bins[idx]) > 1 else 0.0
+        if idx in loss_bins:
+            previous_loss = loss_bins[idx]
 
         current_rate: float | None = previous_rate
         if rate_source == "acked":
@@ -225,6 +256,11 @@ def build_trace() -> int:
             current_rate = max(float(args.min_rate_kbit), current_rate)
 
         q_delay = max(0, quantize(previous_delay, args.delay_quantum_ms))
+        q_jitter = max(0, quantize(previous_jitter, args.jitter_quantum_ms))
+        if q_delay <= 0:
+            q_jitter = 0
+        q_loss_value = max(0.0, quantize_float(previous_loss, args.loss_quantum_pct))
+        q_loss = "" if q_loss_value <= 0 else f"{q_loss_value:.1f}".rstrip("0").rstrip(".")
         q_rate = (
             ""
             if current_rate is None or current_rate <= 0
@@ -232,15 +268,15 @@ def build_trace() -> int:
         )
         limit_pkts = str(args.limit_pkts) if q_rate else ""
         note = ";".join(note_bins.get(idx, []))
-        state = (q_delay, q_rate, limit_pkts)
+        state = (q_delay, q_jitter, q_loss, q_rate, limit_pkts)
 
         if idx == 0 or state != previous_state or note:
             rows.append(
                 {
                     "at_ms": str(idx * window_ms),
                     "delay_ms": str(q_delay),
-                    "jitter_ms": "0",
-                    "loss_pct": "0",
+                    "jitter_ms": str(q_jitter),
+                    "loss_pct": q_loss or "0",
                     "rate_kbit": q_rate,
                     "limit_pkts": limit_pkts,
                     "note": note or "baseline",
