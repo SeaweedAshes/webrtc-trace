@@ -123,12 +123,15 @@ void ConfigureVideoSenderForResolutionAdaptation(
   }
 
   webrtc::RtpParameters parameters = sender->GetParameters();
+  if (!parameters.encodings.empty()) {
+    parameters.encodings[0].max_framerate = 25.0;
+  }
   parameters.degradation_preference =
       webrtc::DegradationPreference::MAINTAIN_FRAMERATE;
   webrtc::RTCError error = sender->SetParameters(parameters);
   if (!error.ok()) {
     RTC_LOG(LS_WARNING)
-        << "Failed to prefer resolution adaptation over framerate adaptation: "
+        << "Failed to configure video sender for 25fps resolution adaptation: "
         << error.message();
   }
 }
