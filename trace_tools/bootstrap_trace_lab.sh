@@ -63,6 +63,25 @@ append_unique_path() {
   esac
 }
 
+append_path_tail() {
+  case ":$PATH:" in
+    *":$1:"*) ;;
+    *) export PATH="$PATH:$1" ;;
+  esac
+}
+
+find_non_depot_ninja() {
+  local ninja_path
+  while IFS= read -r ninja_path; do
+    [[ -n "$ninja_path" ]] || continue
+    case "$ninja_path" in
+      "$DEPOT_TOOLS_DIR"/*) continue ;;
+      *) printf '%s\n' "$ninja_path"; return 0 ;;
+    esac
+  done < <(type -a -p ninja 2>/dev/null || true)
+  return 1
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -118,6 +137,29 @@ ensure_depot_tools() {
   command -v gclient >/dev/null 2>&1 || die "gclient still missing after depot_tools setup"
   command -v gn >/dev/null 2>&1 || die "gn still missing after depot_tools setup"
   command -v autoninja >/dev/null 2>&1 || die "autoninja still missing after depot_tools setup"
+}
+
+ensure_ninja_available() {
+  local ninja_path
+  if ninja_path="$(find_non_depot_ninja)"; then
+    append_path_tail "$(dirname "$ninja_path")"
+    log "using ninja at $ninja_path"
+    return
+  fi
+
+  if [[ -x "$WORKDIR/src/third_party/ninja/ninja" ]]; then
+    append_path_tail "$WORKDIR/src/third_party/ninja"
+    log "using project ninja at $WORKDIR/src/third_party/ninja/ninja"
+    return
+  fi
+
+  if [[ -x "$WORKDIR/src/buildtools/linux64/ninja" ]]; then
+    append_path_tail "$WORKDIR/src/buildtools/linux64"
+    log "using project ninja at $WORKDIR/src/buildtools/linux64/ninja"
+    return
+  fi
+
+  die "ninja not found outside depot_tools; install ninja-build or add a real ninja binary to PATH after depot_tools"
 }
 
 clone_or_update_repo() {
@@ -328,6 +370,7 @@ main() {
   apply_overlay "$lab_root" "$src_root"
 
   if [[ "$SKIP_BUILD" -eq 0 ]]; then
+    ensure_ninja_available
     ensure_gn_gen "$src_root"
     run_build "$src_root"
   else
