@@ -10,6 +10,7 @@ LOG_ROOT="$HOME/webrtc-logs-send"
 RUNS_ROOT="$HOME/trace-runs"
 PORT=8888
 DURATION_SEC=1800
+DURATION_MIN=""
 REVERSE_SSH_PORT=22022
 SIGNAL_SERVER_ROLE="receiver"
 RUN_DATE=""
@@ -35,6 +36,7 @@ Options:
   --log-root PATH             Sender log root (default: $LOG_ROOT)
   --runs-root PATH            Local run bundle root (default: $RUNS_ROOT)
   --duration-sec N            Collection duration (default: $DURATION_SEC)
+  --duration-min N            Collection duration in minutes
   --reverse-ssh-port N        Port exposed on receiver for pulling sender logs
   --signal-server-role ROLE   sender|receiver (default: $SIGNAL_SERVER_ROLE)
   --port N                    Signaling port for peerconnection_server/client (default: $PORT)
@@ -65,6 +67,7 @@ parse_args() {
       --log-root) LOG_ROOT="$2"; shift 2 ;;
       --runs-root) RUNS_ROOT="$2"; shift 2 ;;
       --duration-sec) DURATION_SEC="$2"; shift 2 ;;
+      --duration-min) DURATION_MIN="$2"; shift 2 ;;
       --reverse-ssh-port) REVERSE_SSH_PORT="$2"; shift 2 ;;
       --signal-server-role) SIGNAL_SERVER_ROLE="$2"; shift 2 ;;
       --port) PORT="$2"; shift 2 ;;
@@ -73,7 +76,12 @@ parse_args() {
   done
 
   [[ -n "$RECEIVER_HOST" && -n "$RECEIVER_USER" ]] || usage
+  if [[ -n "$DURATION_MIN" ]]; then
+    [[ "$DURATION_MIN" =~ ^[0-9]+$ ]] || die "duration-min must be numeric"
+    DURATION_SEC="$((DURATION_MIN * 60))"
+  fi
   [[ "$DURATION_SEC" =~ ^[0-9]+$ ]] || die "duration-sec must be numeric"
+  (( DURATION_SEC > 0 )) || die "duration must be greater than zero"
   [[ "$REVERSE_SSH_PORT" =~ ^[0-9]+$ ]] || die "reverse-ssh-port must be numeric"
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric"
   [[ "$SIGNAL_SERVER_ROLE" =~ ^(sender|receiver)$ ]] || die "signal-server-role must be sender or receiver"

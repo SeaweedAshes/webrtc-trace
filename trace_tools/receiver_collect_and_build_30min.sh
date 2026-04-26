@@ -10,6 +10,7 @@ LOG_ROOT="$HOME/webrtc-logs-recv"
 RUNS_ROOT="$HOME/trace-runs"
 PORT=8888
 DURATION_SEC=1800
+DURATION_MIN=""
 WAIT_TIMEOUT_SEC=900
 RECEIVER_OFFSET_MS=0
 SENDER_SSH_PORT_ON_RECEIVER=22022
@@ -33,6 +34,7 @@ Options:
   --log-root PATH             Receiver log root (default: $LOG_ROOT)
   --runs-root PATH            Run bundle root (default: $RUNS_ROOT)
   --duration-sec N            Collection duration (default: $DURATION_SEC)
+  --duration-min N            Collection duration in minutes
   --wait-timeout-sec N        Wait time for sender bundle (default: $WAIT_TIMEOUT_SEC)
   --receiver-offset-ms N      Passed to build_trace_from_logs.py
   --sender-ssh-port-on-receiver N  Reverse SSH port for pulling sender logs
@@ -64,6 +66,7 @@ parse_args() {
       --log-root) LOG_ROOT="$2"; shift 2 ;;
       --runs-root) RUNS_ROOT="$2"; shift 2 ;;
       --duration-sec) DURATION_SEC="$2"; shift 2 ;;
+      --duration-min) DURATION_MIN="$2"; shift 2 ;;
       --wait-timeout-sec) WAIT_TIMEOUT_SEC="$2"; shift 2 ;;
       --receiver-offset-ms) RECEIVER_OFFSET_MS="$2"; shift 2 ;;
       --sender-ssh-port-on-receiver) SENDER_SSH_PORT_ON_RECEIVER="$2"; shift 2 ;;
@@ -73,7 +76,12 @@ parse_args() {
     esac
   done
 
+  if [[ -n "$DURATION_MIN" ]]; then
+    [[ "$DURATION_MIN" =~ ^[0-9]+$ ]] || die "duration-min must be numeric"
+    DURATION_SEC="$((DURATION_MIN * 60))"
+  fi
   [[ "$DURATION_SEC" =~ ^[0-9]+$ ]] || die "duration-sec must be numeric"
+  (( DURATION_SEC > 0 )) || die "duration must be greater than zero"
   [[ "$WAIT_TIMEOUT_SEC" =~ ^[0-9]+$ ]] || die "wait-timeout-sec must be numeric"
   [[ "$RECEIVER_OFFSET_MS" =~ ^-?[0-9]+$ ]] || die "receiver-offset-ms must be numeric"
   [[ "$SENDER_SSH_PORT_ON_RECEIVER" =~ ^[0-9]+$ ]] || die "sender-ssh-port-on-receiver must be numeric"
