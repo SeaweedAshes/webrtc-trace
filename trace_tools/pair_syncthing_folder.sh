@@ -26,7 +26,7 @@ Options:
   --folder-id ID              Syncthing folder ID (default: $FOLDER_ID)
   --folder-label LABEL        Syncthing folder label (default: $FOLDER_LABEL)
   --folder-type TYPE          sendreceive|sendonly|receiveonly|receiveencrypted
-  --gui-port N                Local Syncthing GUI/API port (default: $GUI_PORT)
+  --gui-port N                Ignored in offline-config mode; kept for compatibility
   --home-dir PATH             Syncthing home/config dir (default: $ST_HOME)
 EOF
   exit 1
@@ -58,30 +58,6 @@ parse_args() {
   done
 
   [[ -n "$REMOTE_DEVICE_ID" ]] || usage
-  [[ "$GUI_PORT" =~ ^[0-9]+$ ]] || die "gui-port must be numeric"
-}
-
-read_api_key() {
-  python3 - "$ST_HOME/config.xml" <<'PY'
-import sys
-import xml.etree.ElementTree as ET
-path = sys.argv[1]
-root = ET.parse(path).getroot()
-gui = root.find('./gui')
-apikey = gui.findtext('apikey', default='') if gui is not None else ''
-print(apikey)
-PY
-}
-
-wait_for_api() {
-  local deadline=$((SECONDS + 20))
-  while (( SECONDS < deadline )); do
-    if curl -fsS "http://127.0.0.1:$GUI_PORT/rest/noauth/health" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
 }
 
 local_device_id() {
@@ -89,65 +65,141 @@ local_device_id() {
 }
 
 apply_pairing() {
-  local api_key="$1"
   local local_id
+  local config_path="$ST_HOME/config.xml"
   local_id="$(local_device_id)"
 
-  python3 - "$api_key" "$GUI_PORT" "$REMOTE_DEVICE_ID" "$REMOTE_DEVICE_NAME" "$REMOTE_ADDRESS" "$SHARED_DIR" "$FOLDER_ID" "$FOLDER_LABEL" "$FOLDER_TYPE" "$local_id" <<'PY'
-import json
+  python3 - "$config_path" "$REMOTE_DEVICE_ID" "$REMOTE_DEVICE_NAME" "$REMOTE_ADDRESS" "$SHARED_DIR" "$FOLDER_ID" "$FOLDER_LABEL" "$FOLDER_TYPE" "$local_id" <<'PY'
+import copy
+import os
 import sys
-import urllib.request
+import xml.etree.ElementTree as ET
 
-api_key, gui_port, remote_id, remote_name, remote_addr, shared_dir, folder_id, folder_label, folder_type, local_id = sys.argv[1:]
-base = f"http://127.0.0.1:{gui_port}"
-headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+config_path, remote_id, remote_name, remote_addr, shared_dir, folder_id, folder_label, folder_type, local_id = sys.argv[1:]
 
-def req(method, path, payload=None):
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode()
-    r = urllib.request.Request(base + path, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(r) as resp:
-        body = resp.read()
-        if not body:
-            return None
-        return json.loads(body)
+tree = ET.parse(config_path)
+root = tree.getroot()
 
-devices = req("GET", "/rest/config/devices") or []
-if not any(d.get("deviceID") == remote_id for d in devices):
-    device = req("GET", "/rest/config/defaults/device")
-    device["deviceID"] = remote_id
-    device["name"] = remote_name
-    device["addresses"] = [remote_addr]
-    req("POST", "/rest/config/devices", device)
+devices = root.findall('./device')
+remote_dev = None
+local_dev = None
+for dev in devices:
+    if dev.attrib.get('id') == remote_id:
+        remote_dev = dev
+    if dev.attrib.get('id') == local_id:
+        local_dev = dev
 
-folders = req("GET", "/rest/config/folders") or []
-folder = next((f for f in folders if f.get("id") == folder_id), None)
-if folder is None:
-    folder = req("GET", "/rest/config/defaults/folder")
-    folder["id"] = folder_id
-    folder["label"] = folder_label
-    folder["path"] = shared_dir
-    folder["type"] = folder_type
-    folder["devices"] = [
-        {"deviceID": local_id, "introducedBy": "", "encryptionPassword": ""},
-        {"deviceID": remote_id, "introducedBy": "", "encryptionPassword": ""},
-    ]
-    req("POST", "/rest/config/folders", folder)
+if local_dev is None:
+    local_dev = ET.Element('device', {
+        'id': local_id,
+        'name': os.uname().nodename,
+        'compression': 'metadata',
+        'introducer': 'false',
+        'skipIntroductionRemovals': 'false',
+        'introducedBy': '',
+    })
+    for tag, text in [
+        ('address', 'dynamic'),
+        ('paused', 'false'),
+        ('autoAcceptFolders', 'false'),
+        ('maxSendKbps', '0'),
+        ('maxRecvKbps', '0'),
+        ('maxRequestKiB', '0'),
+        ('untrusted', 'false'),
+        ('remoteGUIPort', '0'),
+    ]:
+        child = ET.SubElement(local_dev, tag)
+        child.text = text
+    root.append(local_dev)
+
+if remote_dev is None:
+    template = copy.deepcopy(local_dev)
+    template.attrib['id'] = remote_id
+    template.attrib['name'] = remote_name
+    template.attrib['introducedBy'] = ''
+    addr = template.find('./address')
+    if addr is None:
+        addr = ET.SubElement(template, 'address')
+    addr.text = remote_addr
+    root.append(template)
 else:
-    folder["path"] = shared_dir
-    folder["label"] = folder_label
-    folder["type"] = folder_type
-    ids = {d.get("deviceID") for d in folder.get("devices", [])}
-    if local_id not in ids:
-        folder.setdefault("devices", []).append({"deviceID": local_id, "introducedBy": "", "encryptionPassword": ""})
-    if remote_id not in ids:
-        folder.setdefault("devices", []).append({"deviceID": remote_id, "introducedBy": "", "encryptionPassword": ""})
-    req("PUT", f"/rest/config/folders/{folder_id}", folder)
+    remote_dev.attrib['name'] = remote_name
+    addr = remote_dev.find('./address')
+    if addr is None:
+        addr = ET.SubElement(remote_dev, 'address')
+    addr.text = remote_addr
 
-restart_needed = req("GET", "/rest/config/restart-required")
-if restart_needed and restart_needed.get("requiresRestart"):
-    req("POST", "/rest/system/restart")
+folder = None
+for f in root.findall('./folder'):
+    if f.attrib.get('id') == folder_id:
+        folder = f
+        break
+
+if folder is None:
+    default_folder = root.find('./folder')
+    if default_folder is not None:
+        folder = copy.deepcopy(default_folder)
+        for child in list(folder.findall('./device')):
+            folder.remove(child)
+    else:
+        folder = ET.Element('folder')
+        ET.SubElement(folder, 'filesystemType').text = 'basic'
+        ET.SubElement(folder, 'minDiskFree', {'unit': '%'}).text = '1'
+        versioning = ET.SubElement(folder, 'versioning')
+        ET.SubElement(versioning, 'cleanupIntervalS').text = '3600'
+        ET.SubElement(versioning, 'fsPath').text = ''
+        ET.SubElement(versioning, 'fsType').text = 'basic'
+        for tag, text in [
+            ('copiers', '0'),
+            ('pullerMaxPendingKiB', '0'),
+            ('hashers', '0'),
+            ('order', 'random'),
+            ('ignoreDelete', 'false'),
+            ('scanProgressIntervalS', '0'),
+            ('pullerPauseS', '0'),
+            ('maxConflicts', '10'),
+            ('disableSparseFiles', 'false'),
+            ('disableTempIndexes', 'false'),
+            ('paused', 'false'),
+            ('weakHashThresholdPct', '25'),
+            ('markerName', '.stfolder'),
+            ('copyOwnershipFromParent', 'false'),
+            ('modTimeWindowS', '0'),
+            ('maxConcurrentWrites', '2'),
+            ('disableFsync', 'false'),
+            ('blockPullOrder', 'standard'),
+            ('copyRangeMethod', 'standard'),
+            ('caseSensitiveFS', 'false'),
+            ('junctionsAsDirs', 'false'),
+        ]:
+            ET.SubElement(folder, tag).text = text
+    root.insert(0, folder)
+
+folder.attrib.update({
+    'id': folder_id,
+    'label': folder_label,
+    'path': shared_dir,
+    'type': folder_type,
+    'rescanIntervalS': folder.attrib.get('rescanIntervalS', '3600'),
+    'fsWatcherEnabled': folder.attrib.get('fsWatcherEnabled', 'true'),
+    'fsWatcherDelayS': folder.attrib.get('fsWatcherDelayS', '10'),
+    'ignorePerms': folder.attrib.get('ignorePerms', 'false'),
+    'autoNormalize': folder.attrib.get('autoNormalize', 'true'),
+})
+
+folder_device_ids = {d.attrib.get('id') for d in folder.findall('./device')}
+for device_id in (local_id, remote_id):
+    if device_id not in folder_device_ids:
+        dev_el = ET.Element('device', {'id': device_id, 'introducedBy': ''})
+        ET.SubElement(dev_el, 'encryptionPassword')
+        fs = folder.find('./filesystemType')
+        insert_at = list(folder).index(fs) + 1 if fs is not None else 0
+        folder.insert(insert_at, dev_el)
+
+backup_path = config_path + '.bak'
+tree.write(backup_path, encoding='utf-8', xml_declaration=True)
+tree.write(config_path, encoding='utf-8', xml_declaration=True)
+print(backup_path)
 PY
 }
 
@@ -156,18 +208,16 @@ main() {
   [[ -f "$ST_HOME/config.xml" ]] || die "missing Syncthing config at $ST_HOME/config.xml; run setup_syncthing_node.sh first"
   mkdir -p "$SHARED_DIR"
 
-  wait_for_api || die "Syncthing API is not reachable on 127.0.0.1:$GUI_PORT"
-  local api_key
-  api_key="$(read_api_key)"
-  [[ -n "$api_key" ]] || die "failed to read Syncthing API key"
-
-  apply_pairing "$api_key"
+  local backup_path
+  backup_path="$(apply_pairing)"
 
   log "paired"
   log "  local_device_id=$(local_device_id)"
   log "  remote_device_id=$REMOTE_DEVICE_ID"
   log "  shared_dir=$SHARED_DIR"
   log "  folder_id=$FOLDER_ID"
+  log "  backup=$backup_path"
+  log "  restart Syncthing on this machine to apply the updated config"
 }
 
 main "$@"
