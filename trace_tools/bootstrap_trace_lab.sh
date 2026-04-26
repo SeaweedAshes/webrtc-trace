@@ -9,7 +9,7 @@ WORKDIR="$HOME/webrtc-trace-lab-repo"
 DEPOT_TOOLS_DIR="${DEPOT_TOOLS_DIR:-$HOME/depot_tools}"
 BUILD_DIR="out/Trace"
 TARGETS=("peerconnection_client" "peerconnection_server" "rtc_unittests")
-SYNC_ARGS=("--nohooks" "--shallow")
+SYNC_ARGS=("--nohooks" "--jobs" "1")
 DEFAULT_GN_ARGS=$'rtc_build_examples = true\nrtc_include_tests = true\nis_debug = false\nuse_sysroot = false'
 GN_ARGS_TEXT=""
 SKIP_BUILD=0
@@ -34,6 +34,7 @@ Options:
   --skip-build                Stop after clone/update + gclient sync
   --force-gclient-sync        Always run gclient sync even if src/ exists
   --force-gn-gen              Always rerun gn gen
+  --sync-arg ARG              Extra arg forwarded to gclient sync
 
 Repository layouts supported:
   1. repo root contains .gclient and src/
@@ -82,6 +83,7 @@ parse_args() {
       --skip-build) SKIP_BUILD=1; shift ;;
       --force-gclient-sync) FORCE_GCLIENT_SYNC=1; shift ;;
       --force-gn-gen) FORCE_GN_GEN=1; shift ;;
+      --sync-arg) SYNC_ARGS+=("$2"); shift 2 ;;
       *) usage ;;
     esac
   done
@@ -161,42 +163,78 @@ read_pinned_revision() {
   fi
 }
 
+cleanup_failed_sync_artifacts() {
+  local lab_root="$1"
+  if [[ -d "$lab_root/_bad_scm" ]]; then
+    log "removing failed checkout artifacts under $lab_root/_bad_scm"
+    rm -rf "$lab_root/_bad_scm"
+  fi
+  if [[ -d "$lab_root/src" ]]; then
+    find "$lab_root/src" -type d -name '_gclient_src_*' -prune -exec rm -rf {} + 2>/dev/null || true
+  fi
+}
+
+gclient_sync_once() {
+  local lab_root="$1"
+  local pinned_revision="$2"
+  (
+    cd "$lab_root"
+    if [[ -n "$pinned_revision" ]]; then
+      gclient sync "${SYNC_ARGS[@]}" --revision "src@$pinned_revision"
+    else
+      gclient sync "${SYNC_ARGS[@]}"
+    fi
+  )
+}
+
+run_gclient_sync() {
+  local lab_root="$1"
+  local pinned_revision="$2"
+  local attempt
+  local max_attempts=4
+
+  cleanup_failed_sync_artifacts "$lab_root"
+  for attempt in $(seq 1 "$max_attempts"); do
+    log "gclient sync attempt $attempt/$max_attempts"
+    if gclient_sync_once "$lab_root" "$pinned_revision"; then
+      return 0
+    fi
+    cleanup_failed_sync_artifacts "$lab_root"
+    if [[ -d "$lab_root/src/third_party/.git" ]]; then
+      (
+        cd "$lab_root/src/third_party"
+        git reset --hard HEAD >/dev/null 2>&1 || true
+        git clean -ffd >/dev/null 2>&1 || true
+      )
+    fi
+    if (( attempt < max_attempts )); then
+      local sleep_sec=$((attempt * 20))
+      log "gclient sync failed; sleeping ${sleep_sec}s before retry"
+      sleep "$sleep_sec"
+    fi
+  done
+  die "gclient sync failed after $max_attempts attempts; likely upstream rate limiting (HTTP 429)"
+}
+
 ensure_checkout() {
   local lab_root="$1"
   local pinned_revision
   pinned_revision="$(read_pinned_revision "$lab_root")"
   if [[ ! -d "$lab_root/src" || "$FORCE_GCLIENT_SYNC" -eq 1 ]]; then
     log "running gclient sync in $lab_root"
-    (
-      cd "$lab_root"
-      if [[ -n "$pinned_revision" ]]; then
-        gclient sync "${SYNC_ARGS[@]}" --revision "src@$pinned_revision"
-      else
-        gclient sync "${SYNC_ARGS[@]}"
-      fi
-    )
+    run_gclient_sync "$lab_root" "$pinned_revision"
     return
   fi
 
   if [[ ! -f "$lab_root/src/.gn" || ! -d "$lab_root/src/build" ]]; then
     log "src checkout looks incomplete; running gclient sync"
-    (
-      cd "$lab_root"
-      if [[ -n "$pinned_revision" ]]; then
-        gclient sync "${SYNC_ARGS[@]}" --revision "src@$pinned_revision"
-      else
-        gclient sync "${SYNC_ARGS[@]}"
-      fi
-    )
+    run_gclient_sync "$lab_root" "$pinned_revision"
   elif [[ -n "$pinned_revision" ]]; then
     local current_head
     current_head="$(git -C "$lab_root/src" rev-parse HEAD 2>/dev/null || true)"
     if [[ "$current_head" != "$pinned_revision" ]]; then
       log "existing src checkout at $current_head; syncing pinned revision $pinned_revision"
-      (
-        cd "$lab_root"
-        gclient sync "${SYNC_ARGS[@]}" --revision "src@$pinned_revision"
-      )
+      run_gclient_sync "$lab_root" "$pinned_revision"
     else
       log "existing src checkout already matches pinned revision $pinned_revision"
     fi

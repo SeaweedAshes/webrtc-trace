@@ -26,6 +26,7 @@ RECEIVER_OFFSET_MS=0
 RUN_DIR=""
 RECORD_TRACE=""
 SKIP_BUILD=0
+DURATION_SEC=0
 
 usage() {
   cat <<EOF
@@ -37,6 +38,7 @@ Options:
   --window-ms N               aggregation window for build_trace_from_logs.py
   --receiver-offset-ms N      optional sender/receiver offset for freeze notes
   --ref-audio PATH            wav file to play into the sender
+  --duration-sec N            keep media flowing for N seconds by looping ref audio
   --port N                    signaling port (default: 8888)
 EOF
   exit 1
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --window-ms) WINDOW_MS="$2"; shift 2 ;;
     --receiver-offset-ms) RECEIVER_OFFSET_MS="$2"; shift 2 ;;
     --ref-audio) REF_AUDIO="$2"; shift 2 ;;
+    --duration-sec) DURATION_SEC="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     *) usage ;;
   esac
@@ -60,6 +63,7 @@ done
 [[ -x "$SERVER_BIN" ]] || { echo "missing server binary: $SERVER_BIN" >&2; exit 1; }
 [[ -f "$TRACE_BUILD_TOOL" ]] || { echo "missing build tool: $TRACE_BUILD_TOOL" >&2; exit 1; }
 [[ -f "$REF_AUDIO" ]] || { echo "missing ref audio: $REF_AUDIO" >&2; exit 1; }
+[[ "$DURATION_SEC" =~ ^[0-9]+$ ]] || { echo "duration-sec must be a non-negative integer" >&2; exit 1; }
 if [[ -n "$RECORD_TRACE" ]]; then
   [[ -f "$TRACE_REPLAY_TOOL" ]] || { echo "missing replay tool: $TRACE_REPLAY_TOOL" >&2; exit 1; }
   [[ -f "$RECORD_TRACE" ]] || { echo "missing trace file: $RECORD_TRACE" >&2; exit 1; }
@@ -104,6 +108,21 @@ start_in_ns() {
 start_pg() {
   local logfile="$1"; shift
   setsid bash -c "exec \"\$@\" >\"$logfile\" 2>&1" _ "$@" &
+  echo $!
+}
+
+start_looped_playback() {
+  local logfile="$1"
+  local device="$2"
+  local wav_path="$3"
+  local duration_sec="$4"
+  setsid bash -lc '
+    set -euo pipefail
+    end_ts=$((SECONDS + '"$duration_sec"'))
+    while (( SECONDS < end_ts )); do
+      paplay --device='"$device"' '"$wav_path"'
+    done
+  ' >"$logfile" 2>&1 &
   echo $!
 }
 
@@ -204,13 +223,21 @@ if [[ -n "$RECORD_TRACE" ]]; then
   sleep 0.2
 fi
 
-PG_PAPLAY=$(start_pg "$RUN_DIR/paplay.log" paplay --device="$SEND_SINK" "$REF_AUDIO")
+if [[ "$DURATION_SEC" -gt 0 ]]; then
+  PG_PAPLAY=$(start_looped_playback "$RUN_DIR/paplay.log" "$SEND_SINK" "$REF_AUDIO" "$DURATION_SEC")
+else
+  PG_PAPLAY=$(start_pg "$RUN_DIR/paplay.log" paplay --device="$SEND_SINK" "$REF_AUDIO")
+fi
 
 wait_count=0
 while kill -0 "$PG_PAPLAY" 2>/dev/null; do
   sleep 0.5
   wait_count=$((wait_count + 1))
-  [[ $wait_count -gt 30 ]] && fail "paplay timeout"
+  if [[ "$DURATION_SEC" -gt 0 ]]; then
+    [[ $wait_count -gt $((DURATION_SEC * 4 + 120)) ]] && fail "looped playback timeout"
+  else
+    [[ $wait_count -gt 30 ]] && fail "paplay timeout"
+  fi
 done
 
 sleep 1.5
