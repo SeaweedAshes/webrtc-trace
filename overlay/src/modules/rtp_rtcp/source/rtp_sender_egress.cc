@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/no_destructor.h"
 #include "api/call/transport.h"
 #include "api/environment/environment.h"
 #include "api/rtc_event_log/rtc_event_log.h"
@@ -299,17 +300,18 @@ void RtpSenderEgress::CompleteSendPacket(const Packet& compound_packet,
   options.batchable = enable_send_packet_batching_ && !is_audio_;
   options.last_packet_in_batch = last_in_batch;
   {
-    static FILE* rtp_log = rtc::OpenCsvLog(
+    static absl::NoDestructor<rtc::AsyncCsvLog> rtp_log(
         "rtp_send.csv",
-        "send_time_ms,ssrc,seq_num,payload_size,is_audio,packet_type\n");
-    if (rtp_log && options.is_media) {
-      fprintf(rtp_log, "%lld,%u,%u,%zu,%d,%d\n",
-              (long long)now.ms(),
-              packet->Ssrc(),
-              (unsigned)packet->SequenceNumber(),
-              packet->payload_size(),
-              (int)is_audio_,
-              (int)(*packet->packet_type()));
+        "send_time_ms,ssrc,seq_num,rtp_timestamp,marker,payload_size,"
+        "is_audio,packet_type\n");
+    if (options.is_media) {
+      char row[160];
+      int len = snprintf(row, sizeof(row), "%lld,%u,%u,%u,%d,%zu,%d,%d\n",
+                         (long long)now.ms(), packet->Ssrc(),
+                         (unsigned)packet->SequenceNumber(), packet->Timestamp(),
+                         (int)packet->Marker(), packet->payload_size(),
+                         (int)is_audio_, (int)(*packet->packet_type()));
+      rtp_log->WriteLine(row, static_cast<size_t>(len));
     }
   }
   const bool send_success = SendPacketToNetwork(*packet, options, pacing_info);

@@ -30,10 +30,18 @@
 #ifndef RTC_BASE_CSV_LOG_H_
 #define RTC_BASE_CSV_LOG_H_
 
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <sys/stat.h>
 
 namespace rtc {
@@ -70,20 +78,164 @@ inline const char* CsvSessionDir() {
   return session_dir;
 }
 
-inline FILE* OpenCsvLog(const char* filename, const char* header) {
+inline FILE* OpenCsvLogWithBuffering(const char* filename,
+                                     const char* header,
+                                     bool line_buffered,
+                                     const char* mode) {
   char path[512];
   snprintf(path, sizeof(path), "%s/%s", CsvSessionDir(), filename);
-  FILE* f = fopen(path, "w");
+  bool write_header = true;
+  if (mode && mode[0] == 'a') {
+    struct stat st;
+    write_header = stat(path, &st) != 0 || st.st_size == 0;
+  }
+  FILE* f = fopen(path, mode ? mode : "w");
   if (f) {
-    // Line-buffered: each fprintf call ending with '\n' flushes immediately,
-    // so the last line is never lost when the process exits.
-    setvbuf(f, nullptr, _IOLBF, 0);
-    if (header) {
+    if (line_buffered) {
+      // Line-buffered: each fprintf call ending with '\n' flushes immediately,
+      // so the last line is never lost when the process exits.
+      setvbuf(f, nullptr, _IOLBF, 0);
+    } else {
+      // Packet-level logs are written by a background thread and should batch
+      // disk I/O rather than flushing every row.
+      setvbuf(f, nullptr, _IOFBF, 1024 * 1024);
+    }
+    if (header && write_header) {
       fputs(header, f);
     }
   }
   return f;
 }
+
+inline FILE* OpenCsvLog(const char* filename, const char* header) {
+  return OpenCsvLogWithBuffering(filename, header, true, "w");
+}
+
+inline FILE* OpenCsvLogBuffered(const char* filename, const char* header) {
+  return OpenCsvLogWithBuffering(filename, header, false, "w");
+}
+
+inline FILE* AppendCsvLog(const char* filename, const char* header) {
+  return OpenCsvLogWithBuffering(filename, header, true, "a");
+}
+
+class AsyncCsvLog {
+ public:
+  AsyncCsvLog(const char* filename,
+              const char* header,
+              size_t max_queue_rows = 65536)
+      : filename_(filename),
+        file_(OpenCsvLogBuffered(filename, header)),
+        max_queue_rows_(max_queue_rows) {
+    if (file_) {
+      writer_ = std::thread([this] { WriterLoop(); });
+    }
+  }
+
+  AsyncCsvLog(const AsyncCsvLog&) = delete;
+  AsyncCsvLog& operator=(const AsyncCsvLog&) = delete;
+
+  ~AsyncCsvLog() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_one();
+    if (writer_.joinable()) {
+      writer_.join();
+    }
+    if (file_) {
+      fclose(file_);
+    }
+    if (FILE* stats = AppendCsvLog(
+            "logging_stats.csv",
+            "timestamp_ms,filename,enqueued_rows,dropped_rows,max_queue_depth\n")) {
+      fprintf(stats, "%lld,%s,%llu,%llu,%llu\n",
+              static_cast<long long>(time(nullptr) * 1000LL),
+              filename_.c_str(),
+              static_cast<unsigned long long>(enqueued_rows_.load()),
+              static_cast<unsigned long long>(dropped_rows_.load()),
+              static_cast<unsigned long long>(max_queue_depth_.load()));
+      fclose(stats);
+    }
+  }
+
+  void WriteLine(const char* row, size_t len) {
+    if (!file_ || row == nullptr || len == 0) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (queue_.size() >= max_queue_rows_) {
+        dropped_rows_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      queue_.emplace_back(row);
+      enqueued_rows_.fetch_add(1, std::memory_order_relaxed);
+      uint64_t depth = queue_.size();
+      uint64_t previous = max_queue_depth_.load(std::memory_order_relaxed);
+      while (depth > previous &&
+             !max_queue_depth_.compare_exchange_weak(
+                 previous, depth, std::memory_order_relaxed)) {
+      }
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  void WriterLoop() {
+    std::deque<std::string> local;
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+        queue_.swap(local);
+        if (stop_ && local.empty()) {
+          break;
+        }
+      }
+      for (const std::string& row : local) {
+        fputs(row.c_str(), file_);
+      }
+      local.clear();
+      fflush(file_);
+      MaybeWriteStats();
+    }
+    fflush(file_);
+  }
+
+  void MaybeWriteStats() {
+    uint64_t enqueued = enqueued_rows_.load(std::memory_order_relaxed);
+    if (enqueued - last_stats_rows_ < 1000) {
+      return;
+    }
+    last_stats_rows_ = enqueued;
+    if (FILE* stats = AppendCsvLog(
+            "logging_stats.csv",
+            "timestamp_ms,filename,enqueued_rows,dropped_rows,max_queue_depth\n")) {
+      fprintf(stats, "%lld,%s,%llu,%llu,%llu\n",
+              static_cast<long long>(time(nullptr) * 1000LL),
+              filename_.c_str(),
+              static_cast<unsigned long long>(enqueued),
+              static_cast<unsigned long long>(dropped_rows_.load()),
+              static_cast<unsigned long long>(max_queue_depth_.load()));
+      fclose(stats);
+    }
+  }
+
+  std::string filename_;
+  FILE* file_ = nullptr;
+  const size_t max_queue_rows_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::string> queue_;
+  std::thread writer_;
+  bool stop_ = false;
+  uint64_t last_stats_rows_ = 0;
+  std::atomic<uint64_t> enqueued_rows_{0};
+  std::atomic<uint64_t> dropped_rows_{0};
+  std::atomic<uint64_t> max_queue_depth_{0};
+};
 
 }  // namespace rtc
 

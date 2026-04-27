@@ -18,6 +18,7 @@
 #include <variant>
 #include <vector>
 
+#include "absl/base/no_destructor.h"
 #include "api/video/video_codec_type.h"
 #include "api/video/video_frame_type.h"
 #include "common_video/h264/h264_common.h"
@@ -35,18 +36,19 @@ namespace webrtc {
 namespace video_coding {
 
 namespace {
-FILE* PacketBufferLog() {
-  static FILE* f = rtc::OpenCsvLog(
+rtc::AsyncCsvLog* PacketBufferLog() {
+  static absl::NoDestructor<rtc::AsyncCsvLog> log(
       "packet_buffer_events.csv",
       "timestamp_ms,event,seq_num,frame_packet_count,buffer_cleared\n");
-  return f;
+  return &*log;
 }
 
-FILE* PacketBufferInsertLog() {
-  static FILE* f = rtc::OpenCsvLog(
+rtc::AsyncCsvLog* PacketBufferInsertLog() {
+  static absl::NoDestructor<rtc::AsyncCsvLog> log(
       "packet_buffer_inserts.csv",
-      "timestamp_ms,seq_num,missing_count,smallest_missing\n");
-  return f;
+      "timestamp_ms,ssrc,seq_num,rtp_timestamp,marker,payload_size,"
+      "missing_count,smallest_missing\n");
+  return &*log;
 }
 }  // namespace
 
@@ -55,8 +57,10 @@ PacketBuffer::Packet::Packet(const RtpPacketReceived& rtp_packet,
                              const RTPVideoHeader& video_header)
     : marker_bit(rtp_packet.Marker()),
       payload_type(rtp_packet.PayloadType()),
+      ssrc(rtp_packet.Ssrc()),
       sequence_number(sequence_number),
       timestamp(rtp_packet.Timestamp()),
+      payload_size(rtp_packet.payload_size()),
       times_nacked(-1),
       video_header(video_header) {
   // Unwrapped sequence number should match the original wrapped one.
@@ -127,11 +131,10 @@ PacketBuffer::InsertResult PacketBuffer::InsertPacket(
       RTC_LOG(LS_WARNING) << "Clear PacketBuffer and request key frame.";
       ClearInternal();
       result.buffer_cleared = true;
-      if (FILE* f = PacketBufferLog()) {
-        fprintf(f, "%lld,buffer_cleared,%u,0,1\n",
-                (long long)webrtc::TimeMillis(),
-                (unsigned)seq_num);
-      }
+      char row[96];
+      int len = snprintf(row, sizeof(row), "%lld,buffer_cleared,%u,0,1\n",
+                         (long long)webrtc::TimeMillis(), (unsigned)seq_num);
+      PacketBufferLog()->WriteLine(row, static_cast<size_t>(len));
       return result;
     }
   }
@@ -146,25 +149,24 @@ PacketBuffer::InsertResult PacketBuffer::InsertPacket(
       received_padding_.lower_bound(seq_num - (buffer_.size() / 4)));
 
   result.packets = FindFrames(seq_num);
-  if (FILE* f = PacketBufferLog()) {
-    if (!result.packets.empty()) {
-      fprintf(f, "%lld,frame_assembled,%u,%zu,%d\n",
-              (long long)webrtc::TimeMillis(),
-              (unsigned)seq_num,
-              result.packets.size(),
-              (int)result.buffer_cleared);
-    }
+  if (!result.packets.empty()) {
+    char row[96];
+    int len = snprintf(row, sizeof(row), "%lld,frame_assembled,%u,%zu,%d\n",
+                       (long long)webrtc::TimeMillis(), (unsigned)seq_num,
+                       result.packets.size(), (int)result.buffer_cleared);
+    PacketBufferLog()->WriteLine(row, static_cast<size_t>(len));
   }
-  if (FILE* f = PacketBufferInsertLog()) {
-    int smallest = missing_packets_.empty()
-                       ? -1
-                       : static_cast<int>(*missing_packets_.begin());
-    fprintf(f, "%lld,%u,%zu,%d\n",
-            (long long)webrtc::TimeMillis(),
-            (unsigned)seq_num,
-            missing_packets_.size(),
-            smallest);
-  }
+  int smallest = missing_packets_.empty()
+                     ? -1
+                     : static_cast<int>(*missing_packets_.begin());
+  const PacketBuffer::Packet& inserted = *buffer_[index];
+  char row[160];
+  int len = snprintf(row, sizeof(row), "%lld,%u,%u,%u,%d,%zu,%zu,%d\n",
+                     (long long)webrtc::TimeMillis(), inserted.ssrc,
+                     (unsigned)seq_num, inserted.timestamp,
+                     (int)inserted.marker_bit, inserted.payload_size,
+                     missing_packets_.size(), smallest);
+  PacketBufferInsertLog()->WriteLine(row, static_cast<size_t>(len));
   return result;
 }
 
