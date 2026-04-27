@@ -189,9 +189,15 @@ def is_video_send_row(row: dict[str, str]) -> bool:
 
 def build_sender_packet_indexes(
     send_rows: list[dict[str, str]]
-) -> tuple[dict[tuple[int, int], deque[dict[str, int]]], dict[int, deque[dict[str, int]]]]:
+) -> tuple[
+    dict[tuple[int, int, int], deque[dict[str, int]]],
+    dict[tuple[int, int], deque[dict[str, int]]],
+    dict[int, deque[dict[str, int]]],
+]:
+    by_ssrc_seq_rtp: dict[tuple[int, int, int], deque[dict[str, int]]] = defaultdict(deque)
     by_ssrc_seq: dict[tuple[int, int], deque[dict[str, int]]] = defaultdict(deque)
     by_seq: dict[int, deque[dict[str, int]]] = defaultdict(deque)
+    packet_id = 0
     for row in send_rows:
         if not is_video_send_row(row):
             continue
@@ -200,14 +206,34 @@ def build_sender_packet_indexes(
         if seq_num is None or send_time is None:
             continue
         candidate = {
+            "id": packet_id,
             "send_time_ms": send_time,
             "rtp_timestamp": as_int(row, "rtp_timestamp") or -1,
         }
+        packet_id += 1
         ssrc = as_int(row, "ssrc")
         if ssrc is not None:
+            if candidate["rtp_timestamp"] >= 0:
+                by_ssrc_seq_rtp[(ssrc, seq_num, candidate["rtp_timestamp"])].append(
+                    candidate
+                )
             by_ssrc_seq[(ssrc, seq_num)].append(candidate)
         by_seq[seq_num].append(candidate)
-    return by_ssrc_seq, by_seq
+    return by_ssrc_seq_rtp, by_ssrc_seq, by_seq
+
+
+def pop_unused_candidate(
+    candidates: deque[dict[str, int]] | None, used_packet_ids: set[int]
+) -> dict[str, int] | None:
+    if not candidates:
+        return None
+    while candidates and candidates[0]["id"] in used_packet_ids:
+        candidates.popleft()
+    if not candidates:
+        return None
+    candidate = candidates.popleft()
+    used_packet_ids.add(candidate["id"])
+    return candidate
 
 
 def build_trace() -> int:
@@ -284,12 +310,18 @@ def build_trace() -> int:
             acked_bins[idx] += size_bytes
             acked_send_bins[send_idx] += size_bytes
     else:
-        sender_by_ssrc_seq, sender_by_seq = build_sender_packet_indexes(send_rows)
+        (
+            sender_by_ssrc_seq_rtp,
+            sender_by_ssrc_seq,
+            sender_by_seq,
+        ) = build_sender_packet_indexes(send_rows)
 
         matched_packets = 0
-        ssrc_matches = 0
+        exact_matches = 0
+        ssrc_seq_matches = 0
         seq_only_matches = 0
         rtp_timestamp_mismatches = 0
+        used_packet_ids: set[int] = set()
         for row in receiver_packet_rows:
             seq_num = as_int(row, "seq_num")
             recv_time = as_int(row, "timestamp_ms")
@@ -297,19 +329,26 @@ def build_trace() -> int:
                 continue
             candidate = None
             ssrc = as_int(row, "ssrc")
-            if ssrc is not None:
-                candidates = sender_by_ssrc_seq.get((ssrc, seq_num))
-                if candidates:
-                    candidate = candidates.popleft()
-                    ssrc_matches += 1
+            recv_rtp_timestamp = as_int(row, "rtp_timestamp")
+            if ssrc is not None and recv_rtp_timestamp is not None:
+                candidate = pop_unused_candidate(
+                    sender_by_ssrc_seq_rtp.get((ssrc, seq_num, recv_rtp_timestamp)),
+                    used_packet_ids,
+                )
+                if candidate is not None:
+                    exact_matches += 1
+            if candidate is None and ssrc is not None:
+                candidate = pop_unused_candidate(
+                    sender_by_ssrc_seq.get((ssrc, seq_num)), used_packet_ids
+                )
+                if candidate is not None:
+                    ssrc_seq_matches += 1
             if candidate is None:
-                candidates = sender_by_seq.get(seq_num)
-                if candidates:
-                    candidate = candidates.popleft()
+                candidate = pop_unused_candidate(sender_by_seq.get(seq_num), used_packet_ids)
+                if candidate is not None:
                     seq_only_matches += 1
             if candidate is None:
                 continue
-            recv_rtp_timestamp = as_int(row, "rtp_timestamp")
             send_rtp_timestamp = candidate.get("rtp_timestamp", -1)
             if (
                 recv_rtp_timestamp is not None
@@ -329,7 +368,8 @@ def build_trace() -> int:
             )
         note_bins[0].append(
             "receiver_arrival_matches:"
-            f"ssrc={ssrc_matches},seq_only={seq_only_matches},"
+            f"exact={exact_matches},ssrc_seq={ssrc_seq_matches},"
+            f"seq_only={seq_only_matches},"
             f"rtp_ts_mismatch={rtp_timestamp_mismatches}"
         )
 
