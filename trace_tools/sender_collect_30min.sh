@@ -15,6 +15,8 @@ RECEIVER_SSH_PORT=22
 SENDER_LOCAL_SSH_PORT=22
 REVERSE_SSH_PORT=22022
 SIGNAL_SERVER_ROLE="receiver"
+SYSTEM_LOG=1
+SYSTEM_INTERVAL_SEC=1
 RUN_DATE=""
 RUN_ID=""
 RECEIVER_HOST=""
@@ -42,6 +44,9 @@ Options:
   --reverse-ssh-port N        Ignored in local-copy mode; kept for backward compatibility
   --signal-server-role ROLE   sender|receiver (default: $SIGNAL_SERVER_ROLE)
   --port N                    Signaling port for peerconnection_server/client (default: $PORT)
+  --system-log                Enable sender system/thermal logging (default)
+  --no-system-log             Disable sender system/thermal logging
+  --system-interval-sec N     System metric sampling interval (default: $SYSTEM_INTERVAL_SEC)
 EOF
   exit 1
 }
@@ -75,6 +80,9 @@ parse_args() {
       --reverse-ssh-port) REVERSE_SSH_PORT="$2"; shift 2 ;;
       --signal-server-role) SIGNAL_SERVER_ROLE="$2"; shift 2 ;;
       --port) PORT="$2"; shift 2 ;;
+      --system-log) SYSTEM_LOG=1; shift ;;
+      --no-system-log) SYSTEM_LOG=0; shift ;;
+      --system-interval-sec) SYSTEM_INTERVAL_SEC="$2"; shift 2 ;;
       *) usage ;;
     esac
   done
@@ -89,6 +97,9 @@ parse_args() {
   [[ "$SENDER_LOCAL_SSH_PORT" =~ ^[0-9]+$ ]] || die "sender-local-ssh-port must be numeric"
   [[ "$REVERSE_SSH_PORT" =~ ^[0-9]+$ ]] || die "reverse-ssh-port must be numeric"
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric"
+  [[ "$SYSTEM_LOG" =~ ^(0|1)$ ]] || die "system-log must be 0 or 1"
+  [[ "$SYSTEM_INTERVAL_SEC" =~ ^[0-9]+$ ]] || die "system-interval-sec must be numeric"
+  (( SYSTEM_INTERVAL_SEC > 0 )) || die "system-interval-sec must be greater than zero"
   [[ "$SIGNAL_SERVER_ROLE" =~ ^(sender|receiver)$ ]] || die "signal-server-role must be sender or receiver"
   if [[ "$SIGNAL_SERVER_ROLE" == "receiver" && -z "$RECEIVER_HOST" ]]; then
     die "--receiver-host is required when signal-server-role=receiver"
@@ -139,6 +150,8 @@ main() {
   local server_log="$HOME/webrtc-server-$RUN_DATE-$RUN_ID.log"
   local client_log="$HOME/webrtc-sender-$RUN_DATE-$RUN_ID.log"
   local client_server_host
+  local system_tmp="$run_root/sender_system_tmp"
+  local system_pid=""
 
   cd "$src_root"
   if [[ "$SIGNAL_SERVER_ROLE" == "sender" ]]; then
@@ -154,6 +167,17 @@ main() {
 
   log "collecting sender logs for ${DURATION_SEC}s (run_date=$RUN_DATE, run_id=$RUN_ID, server=$client_server_host, port=$PORT)"
   log "client log: $client_log"
+  if [[ "$SYSTEM_LOG" -eq 1 ]]; then
+    rm -rf "$system_tmp"
+    mkdir -p "$system_tmp"
+    log "system log: $system_tmp/thermal_cpu.csv"
+    "$REPO_DIR/trace_tools/collect_system_metrics.sh" \
+      --output-dir "$system_tmp" \
+      --duration-sec "$((DURATION_SEC + 120))" \
+      --interval-sec "$SYSTEM_INTERVAL_SEC" \
+      > "$system_tmp/collector.log" 2>&1 &
+    system_pid=$!
+  fi
   local client_status=0
   timeout "$DURATION_SEC" env WEBRTC_LOG_DIR="$LOG_ROOT" \
     xvfb-run -a --server-args="-screen 0 2560x1440x24" \
@@ -167,6 +191,10 @@ main() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
+  if [[ -n "$system_pid" ]]; then
+    kill "$system_pid" 2>/dev/null || true
+    wait "$system_pid" 2>/dev/null || true
+  fi
 
   if [[ "$client_status" -ne 0 && "$client_status" -ne 124 ]]; then
     die "sender client exited with status $client_status; check $client_log"
@@ -178,6 +206,11 @@ main() {
   rm -rf "$run_dir"
   mkdir -p "$run_dir"
   cp -a "$latest_dir/." "$run_dir/"
+  if [[ -d "$system_tmp" ]]; then
+    mkdir -p "$run_dir/system"
+    cp -a "$system_tmp/." "$run_dir/system/"
+    rm -rf "$system_tmp"
+  fi
 
   cat > "$run_dir/COLLECT_INFO.txt" <<EOF
 receiver_host=$RECEIVER_HOST
@@ -189,6 +222,8 @@ signal_server_role=$SIGNAL_SERVER_ROLE
 run_date=$RUN_DATE
 run_id=$RUN_ID
 port=$PORT
+system_log=$SYSTEM_LOG
+system_interval_sec=$SYSTEM_INTERVAL_SEC
 EOF
 
   log "done"
