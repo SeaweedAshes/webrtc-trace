@@ -71,16 +71,25 @@ def timestamp_span_ms(rows: list[dict[str, str]], key: str) -> int | None:
     return max(vals) - min(vals)
 
 
+def first_timestamp_ms(rows: list[dict[str, str]], key: str) -> int | None:
+    vals = [as_int(r, key) for r in rows]
+    vals = [v for v in vals if v is not None]
+    return min(vals) if vals else None
+
+
 def trim_warmup(
-    rows: list[dict[str, str]], timestamp_key: str, warmup_ms: int
+    rows: list[dict[str, str]],
+    timestamp_key: str,
+    warmup_ms: int,
+    origin_ms: int | None = None,
 ) -> list[dict[str, str]]:
     if warmup_ms <= 0:
         return rows
-    timestamps = [as_int(r, timestamp_key) for r in rows]
-    timestamps = [t for t in timestamps if t is not None]
-    if not timestamps:
+    if origin_ms is None:
+        origin_ms = first_timestamp_ms(rows, timestamp_key)
+    if origin_ms is None:
         return rows
-    cutoff = min(timestamps) + warmup_ms
+    cutoff = origin_ms + warmup_ms
     return [
         row
         for row in rows
@@ -210,6 +219,17 @@ def resolve_side_dirs(run_root: Path) -> tuple[Path, Path]:
 
 def summarize_run(run_root: Path, warmup_ms: int) -> dict[str, object]:
     sender_dir, receiver_dir = resolve_side_dirs(run_root)
+    receiver_frame_rows = read_rows(receiver_dir / "frame_buffer.csv")
+    receiver_sched_rows = read_rows(receiver_dir / "scheduler_events.csv")
+    receiver_audio_rows = read_rows(receiver_dir / "audio_packet_inserts.csv")
+    receiver_origin_candidates = [
+        first_timestamp_ms(receiver_frame_rows, "timestamp_ms"),
+        first_timestamp_ms(receiver_sched_rows, "timestamp_ms"),
+        first_timestamp_ms(receiver_audio_rows, "wall_time_ms"),
+    ]
+    receiver_origin_ms = min(
+        ts for ts in receiver_origin_candidates if ts is not None
+    )
     bwe_rows = trim_warmup(
         read_rows(sender_dir / "bwe_target.csv"), "timestamp_ms", warmup_ms
     )
@@ -217,16 +237,19 @@ def summarize_run(run_root: Path, warmup_ms: int) -> dict[str, object]:
         read_rows(sender_dir / "packet_feedback.csv"), "recv_time_ms", warmup_ms
     )
     frame_rows = trim_warmup(
-        read_rows(receiver_dir / "frame_buffer.csv"), "timestamp_ms", warmup_ms
+        receiver_frame_rows, "timestamp_ms", warmup_ms, receiver_origin_ms
     )
     sched_rows = trim_warmup(
-        read_rows(receiver_dir / "scheduler_events.csv"), "timestamp_ms", warmup_ms
+        receiver_sched_rows, "timestamp_ms", warmup_ms, receiver_origin_ms
     )
     audio_rows = trim_warmup(
-        read_rows(receiver_dir / "audio_packet_inserts.csv"), "wall_time_ms", warmup_ms
+        receiver_audio_rows, "wall_time_ms", warmup_ms, receiver_origin_ms
     )
     freeze_rows = trim_warmup(
-        read_rows(receiver_dir / "video_freeze.csv"), "timestamp_ms", warmup_ms
+        read_rows(receiver_dir / "video_freeze.csv"),
+        "timestamp_ms",
+        warmup_ms,
+        receiver_origin_ms,
     )
     return {
         "sender_dir": str(sender_dir),
