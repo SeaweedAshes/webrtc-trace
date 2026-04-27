@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 
 #include "absl/container/inlined_vector.h"
@@ -55,6 +56,22 @@ FILE* SchedulerEventsLog() {
   return f;
 }
 
+FILE* FrameBufferLog() {
+  static FILE* f = rtc::OpenCsvLog(
+      "frame_buffer.csv",
+      "timestamp_ms,rtp_timestamp,frame_id,is_keyframe,frame_size_bytes,"
+      "spatial_idx,temporal_idx,num_references,ref0,ref1,ref2,ref3,ref4,"
+      "is_last_spatial_layer,delayed_by_retransmission,receive_time_ms,"
+      "render_time_ms,buffer_size,continuous_units,playable_units,inserted,"
+      "drop_reason\n");
+  return f;
+}
+
+int64_t FrameReferenceAt(const EncodedFrame& frame, size_t index) {
+  std::span<const int64_t> refs(frame.references, frame.num_references);
+  return index < refs.size() ? refs[index] : -1;
+}
+
 // Max number of frames the buffer will hold.
 constexpr size_t kMaxFramesBuffered = 800;
 // Max number of decoded frame info that will be saved.
@@ -72,7 +89,17 @@ struct FrameMetadata {
         contentType(frame.contentType()),
         delayed_by_retransmission(frame.delayed_by_retransmission()),
         rtp_timestamp(frame.RtpTimestamp()),
-        receive_time(frame.ReceivedTimestamp()) {}
+        receive_time(frame.ReceivedTimestamp()),
+        render_time_ms(frame.RenderTimeMs()),
+        frame_id(frame.Id()),
+        spatial_idx(frame.SpatialIndex().value_or(-1)),
+        temporal_idx(frame.TemporalIndex().value_or(-1)),
+        num_references(frame.num_references),
+        ref0(FrameReferenceAt(frame, 0)),
+        ref1(FrameReferenceAt(frame, 1)),
+        ref2(FrameReferenceAt(frame, 2)),
+        ref3(FrameReferenceAt(frame, 3)),
+        ref4(FrameReferenceAt(frame, 4)) {}
 
   const bool is_last_spatial_layer;
   const bool is_keyframe;
@@ -81,6 +108,16 @@ struct FrameMetadata {
   const bool delayed_by_retransmission;
   const uint32_t rtp_timestamp;
   const std::optional<Timestamp> receive_time;
+  const int64_t render_time_ms;
+  const int64_t frame_id;
+  const int spatial_idx;
+  const int temporal_idx;
+  const size_t num_references;
+  const int64_t ref0;
+  const int64_t ref1;
+  const int64_t ref2;
+  const int64_t ref3;
+  const int64_t ref4;
 };
 
 Timestamp MinReceiveTime(const EncodedFrame& frame) {
@@ -170,6 +207,31 @@ std::optional<int64_t> VideoStreamBufferController::InsertFrame(
   int complete_units_before =
       buffer_->GetTotalNumberOfContinuousTemporalUnits();
   bool inserted = buffer_->InsertFrame(std::move(frame));
+  if (FILE* fb_log = FrameBufferLog()) {
+    const int64_t receive_time_ms =
+        metadata.receive_time ? metadata.receive_time->ms() : -1;
+    const char* drop_reason = inserted ? "" : "frame_buffer_reject";
+    fprintf(fb_log,
+            "%lld,%u,%lld,%d,%zu,%d,%d,%zu,%lld,%lld,%lld,%lld,%lld,%d,%d,"
+            "%lld,%lld,%d,%d,%d,%d,%s\n",
+            (long long)clock_->CurrentTime().ms(),
+            (unsigned)metadata.rtp_timestamp, (long long)metadata.frame_id,
+            (int)metadata.is_keyframe, (size_t)metadata.size,
+            metadata.spatial_idx, metadata.temporal_idx,
+            (size_t)metadata.num_references,
+            (long long)metadata.ref0,
+            (long long)metadata.ref1,
+            (long long)metadata.ref2,
+            (long long)metadata.ref3,
+            (long long)metadata.ref4,
+            (int)metadata.is_last_spatial_layer,
+            (int)metadata.delayed_by_retransmission,
+            (long long)receive_time_ms, (long long)metadata.render_time_ms,
+            (int)buffer_->CurrentSize(),
+            (int)buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+            (int)buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+            (int)inserted, drop_reason);
+  }
   if (inserted) {
     RTC_DCHECK(metadata.receive_time) << "Frame receive time must be set!";
     if (!metadata.delayed_by_retransmission && metadata.receive_time &&
@@ -183,24 +245,6 @@ std::optional<int64_t> VideoStreamBufferController::InsertFrame(
       stats_proxy_->OnCompleteFrame(metadata.is_keyframe, metadata.size,
                                     metadata.contentType);
       MaybeScheduleFrameForRelease();
-    }
-
-    // Log every frame insertion attempt for jitter buffer analysis.
-    // inserted=0 means dropped (already decoded, buffer full, or invalid refs).
-    {
-      static FILE* fb_log = rtc::OpenCsvLog(
-          "frame_buffer.csv",
-          "timestamp_ms,rtp_timestamp,is_keyframe,frame_size_bytes,"
-          "buffer_size,continuous_units,playable_units,inserted\n");
-      if (fb_log) {
-        fprintf(fb_log, "%lld,%u,%d,%zu,%d,%d,%d,%d\n",
-                (long long)clock_->CurrentTime().ms(),
-                (unsigned)metadata.rtp_timestamp, (int)metadata.is_keyframe,
-                (size_t)metadata.size, (int)buffer_->CurrentSize(),
-                (int)buffer_->GetTotalNumberOfContinuousTemporalUnits(),
-                (int)buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
-                (int)inserted);
-      }
     }
   }
 
