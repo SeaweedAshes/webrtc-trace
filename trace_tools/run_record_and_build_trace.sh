@@ -187,14 +187,14 @@ sudo -n ip netns exec "$NS_SEND" ss -ltn 2>/dev/null | grep -q ":$PORT " || fail
 WEBRTC_LOG_DIR="$RUN_DIR/webrtc_logs_receiver" \
 PULSE_SINK="$RECV_SINK" PULSE_SOURCE="$RECV_MIC_SRC" \
 PG_RECEIVER=$(start_in_ns "$NS_RECV" "$RUN_DIR/receiver.log" \
-  xvfb-run -a --server-args="-screen 0 640x480x24" \
+  xvfb-run -a --server-args="-screen 0 2560x1440x24" \
   "$CLIENT_BIN" --server="$IP_SEND" --port="$PORT" --autoconnect)
 sleep 2
 
 WEBRTC_LOG_DIR="$RUN_DIR/webrtc_logs_sender" \
 PULSE_SOURCE="$SEND_SRC" PULSE_SINK="$SEND_PLAYOUT" \
 PG_SENDER=$(start_in_ns "$NS_SEND" "$RUN_DIR/sender.log" \
-  xvfb-run -a --server-args="-screen 0 640x480x24" \
+  xvfb-run -a --server-args="-screen 0 2560x1440x24" \
   "$CLIENT_BIN" --server=localhost --port="$PORT" --autoconnect --autocall)
 sleep 2
 

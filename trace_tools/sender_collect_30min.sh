@@ -154,16 +154,22 @@ main() {
 
   log "collecting sender logs for ${DURATION_SEC}s (run_date=$RUN_DATE, run_id=$RUN_ID, server=$client_server_host, port=$PORT)"
   log "client log: $client_log"
+  local client_status=0
   timeout "$DURATION_SEC" env WEBRTC_LOG_DIR="$LOG_ROOT" \
-    xvfb-run -a ./out/Trace/peerconnection_client \
+    xvfb-run -a --server-args="-screen 0 2560x1440x24" \
+      ./out/Trace/peerconnection_client \
       --server="$client_server_host" \
       --port="$PORT" \
       --autoconnect \
-      --autocall > "$client_log" 2>&1 || true
+      --autocall > "$client_log" 2>&1 || client_status=$?
 
   if [[ -n "${server_pid:-}" ]]; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
+  fi
+
+  if [[ "$client_status" -ne 0 && "$client_status" -ne 124 ]]; then
+    die "sender client exited with status $client_status; check $client_log"
   fi
 
   latest_dir="$(latest_log_dir "$LOG_ROOT")"
