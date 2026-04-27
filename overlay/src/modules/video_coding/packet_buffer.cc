@@ -144,6 +144,15 @@ PacketBuffer::InsertResult PacketBuffer::InsertPacket(
 
   UpdateMissingPackets(seq_num);
 
+  const PacketBuffer::Packet& inserted = *buffer_[index];
+  const uint32_t log_ssrc = inserted.ssrc;
+  const uint32_t log_rtp_timestamp = inserted.timestamp;
+  const bool log_marker_bit = inserted.marker_bit;
+  const size_t log_payload_size = inserted.payload_size;
+  const int log_smallest_missing =
+      missing_packets_.empty() ? -1 : static_cast<int>(*missing_packets_.begin());
+  const size_t log_missing_count = missing_packets_.size();
+
   received_padding_.erase(
       received_padding_.begin(),
       received_padding_.lower_bound(seq_num - (buffer_.size() / 4)));
@@ -156,16 +165,12 @@ PacketBuffer::InsertResult PacketBuffer::InsertPacket(
                        result.packets.size(), (int)result.buffer_cleared);
     PacketBufferLog()->WriteLine(row, static_cast<size_t>(len));
   }
-  int smallest = missing_packets_.empty()
-                     ? -1
-                     : static_cast<int>(*missing_packets_.begin());
-  const PacketBuffer::Packet& inserted = *buffer_[index];
   char row[160];
   int len = snprintf(row, sizeof(row), "%lld,%u,%u,%u,%d,%zu,%zu,%d\n",
-                     (long long)webrtc::TimeMillis(), inserted.ssrc,
-                     (unsigned)seq_num, inserted.timestamp,
-                     (int)inserted.marker_bit, inserted.payload_size,
-                     missing_packets_.size(), smallest);
+                     (long long)webrtc::TimeMillis(), log_ssrc,
+                     (unsigned)seq_num, log_rtp_timestamp,
+                     (int)log_marker_bit, log_payload_size, log_missing_count,
+                     log_smallest_missing);
   PacketBufferInsertLog()->WriteLine(row, static_cast<size_t>(len));
   return result;
 }
