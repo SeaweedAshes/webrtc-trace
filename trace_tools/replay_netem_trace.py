@@ -48,6 +48,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="print commands without executing them",
     )
+    parser.add_argument(
+        "--update-mode",
+        choices=("change", "replace"),
+        default="replace",
+        help=(
+            "after the initial qdisc install, use `tc qdisc change` or "
+            "`tc qdisc replace` for netem parameter updates"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -85,6 +94,7 @@ def build_tc_cmd(
     namespace: str | None,
     iface: str,
     *,
+    operation: str,
     use_sudo: bool,
     delay_ms: int,
     jitter_ms: int,
@@ -94,7 +104,7 @@ def build_tc_cmd(
 ) -> list[str]:
     cmd = tc_prefix(namespace, use_sudo) + [
         "qdisc",
-        "replace",
+        operation,
         "dev",
         iface,
         "root",
@@ -115,14 +125,15 @@ def build_tc_cmd(
     return cmd
 
 
-def run_cmd(cmd: list[str], dry_run: bool) -> None:
+def run_cmd(cmd: list[str], dry_run: bool, *, check: bool = True) -> subprocess.CompletedProcess[str] | None:
     printable = " ".join(cmd)
     print(printable, flush=True)
-    if not dry_run:
-        subprocess.run(cmd, check=True)
+    if dry_run:
+        return None
+    return subprocess.run(cmd, check=check, text=True, capture_output=True)
 
 
-def apply_row(args: argparse.Namespace, row: dict[str, str]) -> None:
+def apply_row(args: argparse.Namespace, row: dict[str, str], operation: str) -> None:
     delay_ms = int(row["delay_ms"] or 0)
     jitter_ms = int(row["jitter_ms"] or 0)
     loss_pct = float(row["loss_pct"] or 0)
@@ -131,6 +142,7 @@ def apply_row(args: argparse.Namespace, row: dict[str, str]) -> None:
     cmd = build_tc_cmd(
         args.namespace,
         args.iface,
+        operation=operation,
         use_sudo=args.sudo,
         delay_ms=delay_ms,
         jitter_ms=jitter_ms,
@@ -141,7 +153,25 @@ def apply_row(args: argparse.Namespace, row: dict[str, str]) -> None:
     note = row["note"].strip()
     if note:
         print(f"# {row['at_ms']} ms: {note}", flush=True)
-    run_cmd(cmd, args.dry_run)
+    result = run_cmd(cmd, args.dry_run, check=False)
+    if result is not None and result.returncode != 0:
+        if operation == "change":
+            fallback = build_tc_cmd(
+                args.namespace,
+                args.iface,
+                operation="replace",
+                use_sudo=args.sudo,
+                delay_ms=delay_ms,
+                jitter_ms=jitter_ms,
+                loss_pct=loss_pct,
+                rate_kbit=rate_kbit,
+                limit_pkts=limit_pkts,
+            )
+            print("# change failed; falling back to replace", flush=True)
+            run_cmd(fallback, args.dry_run)
+        else:
+            sys.stderr.write(result.stderr)
+            result.check_returncode()
 
 
 def main() -> int:
@@ -149,13 +179,14 @@ def main() -> int:
     rows = read_trace(args.trace)
     start = time.monotonic()
 
-    for row in rows:
+    for index, row in enumerate(rows):
         target_s = int(row["at_ms"]) / 1000.0
         now_s = time.monotonic() - start
         sleep_s = target_s - now_s
         if sleep_s > 0:
             time.sleep(sleep_s)
-        apply_row(args, row)
+        operation = "replace" if index == 0 else args.update_mode
+        apply_row(args, row, operation)
 
     if args.reset_at_end:
         reset_row = {
@@ -167,7 +198,7 @@ def main() -> int:
             "limit_pkts": "",
             "note": "reset baseline",
         }
-        apply_row(args, reset_row)
+        apply_row(args, reset_row, "replace")
 
     return 0
 
