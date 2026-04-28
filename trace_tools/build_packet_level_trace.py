@@ -33,6 +33,15 @@ def parse_args() -> argparse.Namespace:
         help="drop the first N seconds of receiver packet arrivals before matching",
     )
     parser.add_argument(
+        "--trace-offset-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "after matching all packets, discard the first N seconds on the "
+            "selected schedule timeline and rebase the trace to at_ms=0"
+        ),
+    )
+    parser.add_argument(
         "--base-delay-percentile",
         type=float,
         default=5.0,
@@ -310,6 +319,25 @@ def main() -> int:
     if not matched:
         raise ValueError("no matched video RTP packets")
 
+    trace_offset_ms = int(args.trace_offset_sec * 1000.0)
+    if trace_offset_ms > 0:
+        full_send_origin_ms = min(m["send_time_ms"] for m in matched)
+        full_recv_origin_ms = min(m["recv_time_ms"] for m in matched)
+        if args.schedule_source == "send":
+            matched = [
+                m
+                for m in matched
+                if m["send_time_ms"] - full_send_origin_ms >= trace_offset_ms
+            ]
+        else:
+            matched = [
+                m
+                for m in matched
+                if m["recv_time_ms"] - full_recv_origin_ms >= trace_offset_ms
+            ]
+        if not matched:
+            raise ValueError("--trace-offset-sec removed all matched packets")
+
     raw_delays = [m["recv_time_ms"] - m["send_time_ms"] for m in matched]
     base_delay_ms = percentile([float(d) for d in raw_delays], args.base_delay_percentile)
     send_origin_ms = min(m["send_time_ms"] for m in matched)
@@ -459,6 +487,7 @@ def main() -> int:
         f"ssrc_seq={ssrc_seq_matches}, seq_only={seq_only_matches}, "
         f"rtp_ts_mismatch={rtp_timestamp_mismatches}, "
         f"drop_warmup_sec={args.drop_warmup_sec}, "
+        f"trace_offset_sec={args.trace_offset_sec}, "
         f"coalesce_ms={args.coalesce_ms}, "
         f"coalesce_by_frame={args.coalesce_by_frame}, "
         f"delay_scale={args.delay_scale}, "
