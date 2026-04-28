@@ -48,6 +48,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Default: <run_dir>/analysis",
     )
+    parser.add_argument(
+        "--audio-extreme-ms",
+        type=float,
+        default=500.0,
+        help="Mark episodes with audio peak gap at or above this value as audio-extreme.",
+    )
+    parser.add_argument(
+        "--audio-path-wide-ms",
+        type=float,
+        default=1000.0,
+        help="Mark episodes with audio peak gap at or above this value as path-wide stalls.",
+    )
+    parser.add_argument(
+        "--audio-path-wide-ratio",
+        type=float,
+        default=0.8,
+        help="Also mark as path-wide when audio peak is this fraction of video peak and >= audio-extreme-ms.",
+    )
+    parser.add_argument(
+        "--thermal-csv",
+        default=None,
+        help="Default: <run_dir>/sender/system/thermal_cpu.csv",
+    )
     parser.add_argument("--top", type=int, default=30)
     return parser.parse_args()
 
@@ -355,6 +378,53 @@ def observed_frame_interval(rendered_frames_path: Path, fallback_ms: float) -> f
     return median(gaps) if gaps else fallback_ms
 
 
+def load_thermal_samples(path: Path) -> tuple[list[dict[str, float]], float | None, float | None]:
+    if not path.exists():
+        return [], None, None
+    rows = read_csv(path)
+    if not rows:
+        return [], None, None
+    start = to_float(rows[0].get("timestamp_ms"))
+    if start is None:
+        return [], None, None
+    samples: list[dict[str, float]] = []
+    for row in rows:
+        t = to_float(row.get("timestamp_ms"))
+        thermal_max = to_float(row.get("thermal_millic_max"))
+        thermal_avg = to_float(row.get("thermal_millic_avg"))
+        cpu_avg = to_float(row.get("cpu_mhz_avg"))
+        load1 = to_float(row.get("load1"))
+        if t is None or thermal_max is None:
+            continue
+        samples.append(
+            {
+                "rel_s": (t - start) / 1000.0,
+                "thermal_max_c": thermal_max / 1000.0,
+                "thermal_avg_c": thermal_avg / 1000.0 if thermal_avg is not None else float("nan"),
+                "cpu_mhz_avg": cpu_avg if cpu_avg is not None else float("nan"),
+                "load1": load1 if load1 is not None else float("nan"),
+            }
+        )
+    thermal_values = [s["thermal_max_c"] for s in samples]
+    return samples, percentile(thermal_values, 95.0), max(thermal_values) if thermal_values else None
+
+
+def nearest_thermal_sample(
+    samples: list[dict[str, float]], rel_s: float
+) -> dict[str, float] | None:
+    if not samples:
+        return None
+    times = [s["rel_s"] for s in samples]
+    idx = bisect.bisect_left(times, rel_s)
+    candidates = []
+    for sample_idx in (idx - 1, idx, idx + 1):
+        if 0 <= sample_idx < len(samples):
+            candidates.append(samples[sample_idx])
+    if not candidates:
+        return None
+    return min(candidates, key=lambda s: abs(s["rel_s"] - rel_s))
+
+
 def write_episode_csv(
     episodes: list[Episode],
     out_path: Path,
@@ -366,6 +436,12 @@ def write_episode_csv(
     audio_baseline_p95_ms: float | None,
     bwe_states: list[dict[str, float]],
     association_ms: float,
+    audio_extreme_ms: float,
+    audio_path_wide_ms: float,
+    audio_path_wide_ratio: float,
+    thermal_samples: list[dict[str, float]],
+    thermal_run_p95_c: float | None,
+    thermal_run_max_c: float | None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for episode in episodes:
@@ -373,6 +449,25 @@ def write_episode_csv(
         freeze = associated_freeze(episode, freezes, association_ms)
         audio_episode = intervals_in_window(audio_times, episode.start_ms, episode.end_ms)
         audio_peak = intervals_in_window(audio_times, peak.start_ms - 1000.0, peak.end_ms + 1000.0)
+        audio_peak_max = max(audio_peak) if audio_peak else None
+        audio_extreme = audio_peak_max is not None and audio_peak_max >= audio_extreme_ms
+        audio_path_wide = False
+        if audio_peak_max is not None:
+            audio_path_wide = audio_peak_max >= audio_path_wide_ms or (
+                audio_peak_max >= audio_extreme_ms
+                and audio_peak_max >= peak.gap_ms * audio_path_wide_ratio
+            )
+        excluded_by_audio = audio_extreme or audio_path_wide
+        peak_rel_s = (peak.start_ms - run_start_ms) / 1000.0
+        thermal = nearest_thermal_sample(thermal_samples, peak_rel_s)
+        thermal_max_c = thermal["thermal_max_c"] if thermal else None
+        thermal_high = (
+            thermal_max_c is not None
+            and (
+                thermal_max_c >= 100.0
+                or (thermal_run_p95_c is not None and thermal_max_c >= thermal_run_p95_c)
+            )
+        )
         before = bwe_window(bwe_states, peak.start_ms - 2000.0, peak.start_ms)
         after = bwe_window(bwe_states, peak.end_ms, peak.end_ms + 10000.0)
         overuse = bwe_window(bwe_states, episode.start_ms, episode.end_ms + 5000.0)
@@ -398,7 +493,7 @@ def write_episode_csv(
             "num_buffer_exhausting_gaps": sum(g.buffer_exhausting for g in episode.gaps),
             "peak_start_ms": round(peak.start_ms, 3),
             "peak_end_ms": round(peak.end_ms, 3),
-            "peak_rel_s": round((peak.start_ms - run_start_ms) / 1000.0, 3),
+            "peak_rel_s": round(peak_rel_s, 3),
             "peak_gap_ms": round(peak.gap_ms, 3),
             "peak_baseline_p75_ms": round(peak.baseline_p75_ms, 3)
             if peak.baseline_p75_ms is not None
@@ -417,10 +512,13 @@ def write_episode_csv(
             else "",
             "audio_episode_gap_max_ms": round(max(audio_episode), 3) if audio_episode else "",
             "audio_peak_gap_p95_ms": round(percentile(audio_peak, 95.0), 3) if audio_peak else "",
-            "audio_peak_gap_max_ms": round(max(audio_peak), 3) if audio_peak else "",
+            "audio_peak_gap_max_ms": round(audio_peak_max, 3) if audio_peak_max is not None else "",
             "audio_baseline_gap_p95_ms": round(audio_baseline_p95_ms, 3)
             if audio_baseline_p95_ms is not None
             else "",
+            "audio_extreme_stall": 1 if audio_extreme else 0,
+            "audio_path_wide_stall": 1 if audio_path_wide else 0,
+            "excluded_by_audio_stall": 1 if excluded_by_audio else 0,
             "gcc_overusing_count": overusing_count,
             "gcc_target_before_bps": round(target_before, 3) if target_before is not None else "",
             "gcc_target_after_min_bps": round(target_after_min, 3)
@@ -428,6 +526,21 @@ def write_episode_csv(
             else "",
             "gcc_target_delta_min_after_bps": round(target_delta, 3) if target_delta is not None else "",
             "gcc_target_decreased": 1 if target_delta is not None and target_delta < 0 else 0,
+            "thermal_max_c": round(thermal_max_c, 3) if thermal_max_c is not None else "",
+            "thermal_avg_c": round(thermal["thermal_avg_c"], 3)
+            if thermal and math.isfinite(thermal["thermal_avg_c"])
+            else "",
+            "thermal_run_p95_c": round(thermal_run_p95_c, 3)
+            if thermal_run_p95_c is not None
+            else "",
+            "thermal_run_max_c": round(thermal_run_max_c, 3)
+            if thermal_run_max_c is not None
+            else "",
+            "thermal_high": 1 if thermal_high else 0,
+            "cpu_mhz_avg": round(thermal["cpu_mhz_avg"], 3)
+            if thermal and math.isfinite(thermal["cpu_mhz_avg"])
+            else "",
+            "load1": round(thermal["load1"], 3) if thermal and math.isfinite(thermal["load1"]) else "",
         }
         rows.append(row)
 
@@ -453,6 +566,11 @@ def main() -> int:
     freeze_path = side_dir / "video_freeze.csv"
     bwe_path = side_dir / "delay_bwe_state.csv"
     rendered_path = side_dir / "receiver_rendered_frames.csv"
+    thermal_path = (
+        Path(args.thermal_csv).expanduser().resolve()
+        if args.thermal_csv
+        else run_dir / "sender" / "system" / "thermal_cpu.csv"
+    )
 
     for required in [packet_path, frame_path]:
         if not required.exists():
@@ -477,6 +595,7 @@ def main() -> int:
     audio_baseline_p95 = percentile(audio_intervals, 95.0)
     freezes = load_freezes(freeze_path)
     bwe_states = load_bwe_states(bwe_path)
+    thermal_samples, thermal_run_p95_c, thermal_run_max_c = load_thermal_samples(thermal_path)
 
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else run_dir / "analysis"
     suffix = f"{args.side}_{int(args.window_ms)}ms_{args.frame_interval_mode}"
@@ -492,13 +611,33 @@ def main() -> int:
         audio_baseline_p95,
         bwe_states,
         args.association_ms,
+        args.audio_extreme_ms,
+        args.audio_path_wide_ms,
+        args.audio_path_wide_ratio,
+        thermal_samples,
+        thermal_run_p95_c,
+        thermal_run_max_c,
     )
 
     associated = [r for r in rows if r.get("associated_freeze") == 1]
+    included_associated = [
+        r
+        for r in associated
+        if r.get("excluded_by_audio_stall") == 0 or r.get("excluded_by_audio_stall") == "0"
+    ]
+    excluded_audio = [r for r in associated if r.get("excluded_by_audio_stall") == 1]
     decreased = [r for r in rows if r.get("gcc_target_decreased") == 1]
     print(f"run={run_dir.name} side={args.side}")
     print(f"frame_interval_ms={frame_interval_ms:.3f} mode={args.frame_interval_mode}")
-    print(f"video_gaps={len(gaps)} episodes={len(rows)} associated_freeze={len(associated)}")
+    print(
+        f"video_gaps={len(gaps)} episodes={len(rows)} associated_freeze={len(associated)} "
+        f"included_associated={len(included_associated)} audio_excluded_associated={len(excluded_audio)}"
+    )
+    if thermal_samples:
+        print(
+            f"thermal_samples={len(thermal_samples)} "
+            f"thermal_run_p95_c={thermal_run_p95_c:.3f} thermal_run_max_c={thermal_run_max_c:.3f}"
+        )
     print(f"gcc_target_decreased_episodes={len(decreased)} output={csv_path}")
     print("top_episodes_by_peak_gap:")
     top_rows = sorted(rows, key=lambda r: float(r["peak_gap_ms"]), reverse=True)[: args.top]
@@ -510,6 +649,8 @@ def main() -> int:
             f"playable={row['peak_playable_units']} freeze={row['associated_freeze']} "
             f"freeze_dur={row['freeze_duration_ms']}ms "
             f"audio_peak_max={row['audio_peak_gap_max_ms']}ms "
+            f"audio_excluded={row['excluded_by_audio_stall']} "
+            f"thermal={row['thermal_max_c']}C "
             f"overuse={row['gcc_overusing_count']} "
             f"target_delta={row['gcc_target_delta_min_after_bps']}"
         )
