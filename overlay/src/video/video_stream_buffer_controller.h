@@ -130,7 +130,7 @@ class VideoStreamBufferController {
       RTC_GUARDED_BY(&worker_sequence_checker_);
   int frames_dropped_before_last_new_frame_
       RTC_GUARDED_BY(&worker_sequence_checker_) = 0;
-  int64_t last_frame_ready_render_time_ms_
+  [[maybe_unused]] int64_t last_frame_ready_render_time_ms_
       RTC_GUARDED_BY(&worker_sequence_checker_) = 0;
   VCMVideoProtection protection_mode_
       RTC_GUARDED_BY(&worker_sequence_checker_) = kProtectionNack;
