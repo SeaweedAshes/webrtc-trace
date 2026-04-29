@@ -171,6 +171,59 @@ FrameBuffer::DecodableTemporalUnitsInfo() const {
   return decodable_temporal_units_info_;
 }
 
+absl::InlinedVector<FrameBuffer::DecodableTemporalUnit, 64>
+FrameBuffer::DecodableTemporalUnits() const {
+  absl::InlinedVector<DecodableTemporalUnit, 64> units;
+  if (!last_continuous_temporal_unit_frame_id_) {
+    return units;
+  }
+
+  auto first_frame_it = frames_.begin();
+  auto last_frame_it = frames_.begin();
+  absl::InlinedVector<int64_t, 4> frames_in_temporal_unit;
+  for (auto frame_it = frames_.begin(); frame_it != frames_.end();) {
+    if (GetFrameId(frame_it) > *last_continuous_temporal_unit_frame_id_) {
+      break;
+    }
+
+    if (GetTimestamp(frame_it) != GetTimestamp(first_frame_it)) {
+      frames_in_temporal_unit.clear();
+      first_frame_it = frame_it;
+    }
+
+    frames_in_temporal_unit.push_back(GetFrameId(frame_it));
+    last_frame_it = frame_it++;
+
+    if (!IsLastFrameInTemporalUnit(last_frame_it)) {
+      continue;
+    }
+
+    bool temporal_unit_decodable = true;
+    for (auto it = first_frame_it; it != frame_it && temporal_unit_decodable;
+         ++it) {
+      for (int64_t reference : GetReferences(it)) {
+        if (!decoded_frame_history_.WasDecoded(reference) &&
+            !absl::c_linear_search(frames_in_temporal_unit, reference)) {
+          temporal_unit_decodable = false;
+          break;
+        }
+      }
+    }
+
+    if (temporal_unit_decodable) {
+      units.push_back(DecodableTemporalUnit{
+          .rtp_timestamp = GetTimestamp(first_frame_it),
+          .first_frame_id = GetFrameId(first_frame_it),
+          .last_frame_id = GetFrameId(last_frame_it),
+          .frame_count = static_cast<size_t>(
+              std::distance(first_frame_it, std::next(last_frame_it))),
+      });
+    }
+  }
+
+  return units;
+}
+
 int FrameBuffer::GetTotalNumberOfContinuousTemporalUnits() const {
   return num_continuous_temporal_units_;
 }

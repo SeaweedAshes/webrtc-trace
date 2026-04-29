@@ -36,6 +36,13 @@ class FrameBuffer {
     uint32_t last_rtp_timestamp;
   };
 
+  struct DecodableTemporalUnit {
+    uint32_t rtp_timestamp;
+    int64_t first_frame_id;
+    int64_t last_frame_id;
+    size_t frame_count;
+  };
+
   // The `max_size` determines the maximum number of frames the buffer will
   // store, and max_decode_history determines how far back (by frame ID) the
   // buffer will store if a frame was decoded or not.
@@ -64,6 +71,8 @@ class FrameBuffer {
   std::optional<int64_t> LastContinuousFrameId() const;
   std::optional<int64_t> LastContinuousTemporalUnitFrameId() const;
   std::optional<DecodabilityInfo> DecodableTemporalUnitsInfo() const;
+  absl::InlinedVector<DecodableTemporalUnit, 64> DecodableTemporalUnits()
+      const;
 
   int GetTotalNumberOfContinuousTemporalUnits() const;
   // Number of dependency-continuous temporal units still buffered and therefore

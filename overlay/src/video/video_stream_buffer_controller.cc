@@ -48,16 +48,16 @@ namespace {
 // Single-callsite CSV log for scheduler events. Using a helper prevents
 // multiple OpenCsvLog() calls from truncating each other (OpenCsvLog uses
 // fopen with "w" mode).
-FILE* SchedulerEventsLog() {
-  static FILE* f = rtc::OpenCsvLog(
+FILE *SchedulerEventsLog() {
+  static FILE *f = rtc::OpenCsvLog(
       "scheduler_events.csv",
       "timestamp_ms,event,drops,decoder_ready,keyframe_required,"
       "buffer_size,continuous_units,playable_units\n");
   return f;
 }
 
-FILE* FrameBufferLog() {
-  static FILE* f = rtc::OpenCsvLog(
+FILE *FrameBufferLog() {
+  static FILE *f = rtc::OpenCsvLog(
       "frame_buffer.csv",
       "timestamp_ms,rtp_timestamp,frame_id,is_keyframe,frame_size_bytes,"
       "spatial_idx,temporal_idx,num_references,ref0,ref1,ref2,ref3,ref4,"
@@ -67,7 +67,159 @@ FILE* FrameBufferLog() {
   return f;
 }
 
-int64_t FrameReferenceAt(const EncodedFrame& frame, size_t index) {
+FILE *DecodeScheduleLog() {
+  static FILE *f = rtc::OpenCsvLog(
+      "decode_schedule.csv",
+      "timestamp_ms,event,rtp_timestamp,last_rtp_timestamp,render_time_ms,"
+      "latest_decode_time_ms,schedule_wait_ms,max_wait_ms,"
+      "scheduled_rtp_timestamp,decoder_ready,keyframe_required,buffer_size,"
+      "continuous_units,playable_units,too_many_frames_queued,extracted_frames,"
+      "drops\n");
+  return f;
+}
+
+FILE *EffectivePlayoutBudgetLog() {
+  static FILE *f = rtc::OpenCsvLog(
+      "effective_playout_budget.csv",
+      "timestamp_ms,event,render_delay_ms,last_frame_ready_render_time_ms,"
+      "buffer_size,continuous_units,playable_units,decodable_units,"
+      "future_render_valid_units,immediate_renderable_units,"
+      "potential_too_old_units,potential_out_of_order_units,"
+      "first_future_release_deadline_ms,latest_future_release_deadline_ms,"
+      "effective_budget_ms,next_rtp_timestamp,last_rtp_timestamp,"
+      "scheduled_rtp_timestamp\n");
+  return f;
+}
+
+FILE *EffectivePlayoutUnitsLog() {
+  static FILE *f = rtc::OpenCsvLog(
+      "effective_playout_units.csv",
+      "timestamp_ms,event,unit_index,rtp_timestamp,first_frame_id,"
+      "last_frame_id,frame_count,render_time_ms,release_deadline_ms,"
+      "release_deadline_delta_ms,is_future_render_valid,"
+      "is_immediate_renderable,is_potential_too_old,"
+      "is_potential_out_of_order\n");
+  return f;
+}
+
+void LogDecodeSchedule(Clock *clock, const char *event, int64_t rtp_timestamp,
+                       int64_t last_rtp_timestamp, int64_t render_time_ms,
+                       int64_t latest_decode_time_ms, int64_t schedule_wait_ms,
+                       int64_t max_wait_ms,
+                       std::optional<uint32_t> scheduled_rtp_timestamp,
+                       bool decoder_ready, bool keyframe_required,
+                       size_t buffer_size, int continuous_units,
+                       int playable_units, bool too_many_frames_queued,
+                       int extracted_frames, int drops) {
+  if (FILE *f = DecodeScheduleLog()) {
+    fprintf(f,
+            "%lld,%s,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d,%d,%zu,%d,%d,%d,%d,"
+            "%d\n",
+            (long long)clock->CurrentTime().ms(), event,
+            (long long)rtp_timestamp, (long long)last_rtp_timestamp,
+            (long long)render_time_ms, (long long)latest_decode_time_ms,
+            (long long)schedule_wait_ms, (long long)max_wait_ms,
+            (long long)(scheduled_rtp_timestamp
+                            ? static_cast<int64_t>(*scheduled_rtp_timestamp)
+                            : -1),
+            (int)decoder_ready, (int)keyframe_required, buffer_size,
+            continuous_units, playable_units, (int)too_many_frames_queued,
+            extracted_frames, drops);
+  }
+}
+
+void LogEffectivePlayoutBudget(
+    Clock *clock, VCMTiming *timing, const FrameBuffer &buffer,
+    FrameDecodeScheduler &frame_decode_scheduler, const char *event,
+    int64_t last_frame_ready_render_time_ms) {
+  Timestamp now = clock->CurrentTime();
+  const int64_t now_ms = now.ms();
+  const auto units = buffer.DecodableTemporalUnits();
+  const auto timings = timing->GetTimings();
+  const int64_t render_delay_ms = timings.render_delay.ms();
+
+  int future_render_valid_units = 0;
+  int immediate_renderable_units = 0;
+  int potential_too_old_units = 0;
+  int potential_out_of_order_units = 0;
+  int64_t first_future_release_deadline_ms = -1;
+  int64_t latest_future_release_deadline_ms = -1;
+
+  FILE *units_log = EffectivePlayoutUnitsLog();
+  for (size_t i = 0; i < units.size(); ++i) {
+    const auto &unit = units[i];
+    const Timestamp render_time =
+        timing->RenderTime(unit.rtp_timestamp, now);
+    const int64_t render_time_ms = render_time.ms();
+    const int64_t release_deadline_ms = render_time_ms - render_delay_ms;
+    const int64_t release_deadline_delta_ms =
+        release_deadline_ms - now_ms;
+    const bool future_render_valid = release_deadline_delta_ms > 0;
+    const bool immediate_renderable = release_deadline_delta_ms <= 0;
+    const bool potential_too_old = render_time_ms + 500 < now_ms;
+    const bool potential_out_of_order =
+        last_frame_ready_render_time_ms > 0 &&
+        render_time_ms < last_frame_ready_render_time_ms;
+
+    future_render_valid_units += future_render_valid ? 1 : 0;
+    immediate_renderable_units += immediate_renderable ? 1 : 0;
+    potential_too_old_units += potential_too_old ? 1 : 0;
+    potential_out_of_order_units += potential_out_of_order ? 1 : 0;
+
+    if (future_render_valid) {
+      if (first_future_release_deadline_ms < 0) {
+        first_future_release_deadline_ms = release_deadline_ms;
+      }
+      latest_future_release_deadline_ms =
+          std::max(latest_future_release_deadline_ms, release_deadline_ms);
+    }
+
+    if (units_log && i < 64) {
+      fprintf(units_log,
+              "%lld,%s,%zu,%u,%lld,%lld,%zu,%lld,%lld,%lld,%d,%d,%d,%d\n",
+              (long long)now_ms, event, i, unit.rtp_timestamp,
+              (long long)unit.first_frame_id, (long long)unit.last_frame_id,
+              unit.frame_count, (long long)render_time_ms,
+              (long long)release_deadline_ms,
+              (long long)release_deadline_delta_ms,
+              (int)future_render_valid, (int)immediate_renderable,
+              (int)potential_too_old, (int)potential_out_of_order);
+    }
+  }
+
+  const int64_t effective_budget_ms =
+      latest_future_release_deadline_ms > now_ms
+          ? latest_future_release_deadline_ms - now_ms
+          : 0;
+
+  if (FILE *f = EffectivePlayoutBudgetLog()) {
+    fprintf(f,
+            "%lld,%s,%lld,%lld,%zu,%d,%d,%zu,%d,%d,%d,%d,%lld,%lld,%lld,%lld,"
+            "%lld,%lld\n",
+            (long long)now_ms, event, (long long)render_delay_ms,
+            (long long)last_frame_ready_render_time_ms, buffer.CurrentSize(),
+            buffer.GetTotalNumberOfContinuousTemporalUnits(),
+            buffer.GetNumberOfBufferedContinuousTemporalUnits(), units.size(),
+            future_render_valid_units, immediate_renderable_units,
+            potential_too_old_units, potential_out_of_order_units,
+            (long long)first_future_release_deadline_ms,
+            (long long)latest_future_release_deadline_ms,
+            (long long)effective_budget_ms,
+            (long long)(units.empty()
+                            ? -1
+                            : static_cast<int64_t>(units.front().rtp_timestamp)),
+            (long long)(units.empty()
+                            ? -1
+                            : static_cast<int64_t>(units.back().rtp_timestamp)),
+            (long long)(frame_decode_scheduler.ScheduledRtpTimestamp()
+                            ? static_cast<int64_t>(
+                                  *frame_decode_scheduler
+                                       .ScheduledRtpTimestamp())
+                            : -1));
+  }
+}
+
+int64_t FrameReferenceAt(const EncodedFrame &frame, size_t index) {
   std::span<const int64_t> refs(frame.references, frame.num_references);
   return index < refs.size() ? refs[index] : -1;
 }
@@ -82,24 +234,19 @@ constexpr int kMaxFramesHistory = 1 << 13;
 constexpr size_t kZeroPlayoutDelayDefaultMaxDecodeQueueSize = 8;
 
 struct FrameMetadata {
-  explicit FrameMetadata(const EncodedFrame& frame)
+  explicit FrameMetadata(const EncodedFrame &frame)
       : is_last_spatial_layer(frame.is_last_spatial_layer),
-        is_keyframe(frame.is_keyframe()),
-        size(frame.size()),
+        is_keyframe(frame.is_keyframe()), size(frame.size()),
         contentType(frame.contentType()),
         delayed_by_retransmission(frame.delayed_by_retransmission()),
         rtp_timestamp(frame.RtpTimestamp()),
         receive_time(frame.ReceivedTimestamp()),
-        render_time_ms(frame.RenderTimeMs()),
-        frame_id(frame.Id()),
+        render_time_ms(frame.RenderTimeMs()), frame_id(frame.Id()),
         spatial_idx(frame.SpatialIndex().value_or(-1)),
         temporal_idx(frame.TemporalIndex().value_or(-1)),
-        num_references(frame.num_references),
-        ref0(FrameReferenceAt(frame, 0)),
-        ref1(FrameReferenceAt(frame, 1)),
-        ref2(FrameReferenceAt(frame, 2)),
-        ref3(FrameReferenceAt(frame, 3)),
-        ref4(FrameReferenceAt(frame, 4)) {}
+        num_references(frame.num_references), ref0(FrameReferenceAt(frame, 0)),
+        ref1(FrameReferenceAt(frame, 1)), ref2(FrameReferenceAt(frame, 2)),
+        ref3(FrameReferenceAt(frame, 3)), ref4(FrameReferenceAt(frame, 4)) {}
 
   const bool is_last_spatial_layer;
   const bool is_keyframe;
@@ -120,9 +267,9 @@ struct FrameMetadata {
   const int64_t ref4;
 };
 
-Timestamp MinReceiveTime(const EncodedFrame& frame) {
+Timestamp MinReceiveTime(const EncodedFrame &frame) {
   Timestamp first_recv_time = Timestamp::PlusInfinity();
-  for (const auto& packet_info : frame.PacketInfos()) {
+  for (const auto &packet_info : frame.PacketInfos()) {
     if (packet_info.receive_time().IsFinite()) {
       first_recv_time = std::min(first_recv_time, packet_info.receive_time());
     }
@@ -130,45 +277,36 @@ Timestamp MinReceiveTime(const EncodedFrame& frame) {
   return first_recv_time;
 }
 
-Timestamp ReceiveTime(const EncodedFrame& frame) {
+Timestamp ReceiveTime(const EncodedFrame &frame) {
   std::optional<Timestamp> ts = frame.ReceivedTimestamp();
   RTC_DCHECK(ts.has_value()) << "Received frame must have a timestamp set!";
   return *ts;
 }
 
-}  // namespace
+} // namespace
 
 VideoStreamBufferController::VideoStreamBufferController(
-    Clock* clock,
-    TaskQueueBase* worker_queue,
-    VCMTiming* timing,
-    VideoStreamBufferControllerStatsObserver* stats_proxy,
-    FrameSchedulingReceiver* receiver,
-    TimeDelta max_wait_for_keyframe,
+    Clock *clock, TaskQueueBase *worker_queue, VCMTiming *timing,
+    VideoStreamBufferControllerStatsObserver *stats_proxy,
+    FrameSchedulingReceiver *receiver, TimeDelta max_wait_for_keyframe,
     TimeDelta max_wait_for_frame,
     std::unique_ptr<FrameDecodeScheduler> frame_decode_scheduler,
-    const FieldTrialsView& field_trials)
-    : field_trials_(field_trials),
-      clock_(clock),
-      stats_proxy_(stats_proxy),
-      receiver_(receiver),
-      timing_(timing),
+    const FieldTrialsView &field_trials)
+    : field_trials_(field_trials), clock_(clock), stats_proxy_(stats_proxy),
+      receiver_(receiver), timing_(timing),
       frame_decode_scheduler_(std::move(frame_decode_scheduler)),
       jitter_estimator_(clock_, field_trials),
       buffer_(std::make_unique<FrameBuffer>(kMaxFramesBuffered,
-                                            kMaxFramesHistory,
-                                            field_trials)),
+                                            kMaxFramesHistory, field_trials)),
       decode_timing_(clock_, timing_),
       timeout_tracker_(
-          clock_,
-          worker_queue,
+          clock_, worker_queue,
           VideoReceiveStreamTimeoutTracker::Timeouts{
               .max_wait_for_keyframe = max_wait_for_keyframe,
               .max_wait_for_frame = max_wait_for_frame},
           absl::bind_front(&VideoStreamBufferController::OnTimeout, this)),
       zero_playout_delay_max_decode_queue_size_(
-          "max_decode_queue_size",
-          kZeroPlayoutDelayDefaultMaxDecodeQueueSize) {
+          "max_decode_queue_size", kZeroPlayoutDelayDefaultMaxDecodeQueueSize) {
   RTC_DCHECK(stats_proxy_);
   RTC_DCHECK(receiver_);
   RTC_DCHECK(timing_);
@@ -200,17 +338,17 @@ void VideoStreamBufferController::Clear() {
   frame_decode_scheduler_->CancelOutstanding();
 }
 
-std::optional<int64_t> VideoStreamBufferController::InsertFrame(
-    std::unique_ptr<EncodedFrame> frame) {
+std::optional<int64_t>
+VideoStreamBufferController::InsertFrame(std::unique_ptr<EncodedFrame> frame) {
   RTC_DCHECK_RUN_ON(&worker_sequence_checker_);
   FrameMetadata metadata(*frame);
   int complete_units_before =
       buffer_->GetTotalNumberOfContinuousTemporalUnits();
   bool inserted = buffer_->InsertFrame(std::move(frame));
-  if (FILE* fb_log = FrameBufferLog()) {
+  if (FILE *fb_log = FrameBufferLog()) {
     const int64_t receive_time_ms =
         metadata.receive_time ? metadata.receive_time->ms() : -1;
-    const char* drop_reason = inserted ? "" : "frame_buffer_reject";
+    const char *drop_reason = inserted ? "" : "frame_buffer_reject";
     fprintf(fb_log,
             "%lld,%u,%lld,%d,%zu,%d,%d,%zu,%lld,%lld,%lld,%lld,%lld,%d,%d,"
             "%lld,%lld,%d,%d,%d,%d,%s\n",
@@ -218,20 +356,18 @@ std::optional<int64_t> VideoStreamBufferController::InsertFrame(
             (unsigned)metadata.rtp_timestamp, (long long)metadata.frame_id,
             (int)metadata.is_keyframe, (size_t)metadata.size,
             metadata.spatial_idx, metadata.temporal_idx,
-            (size_t)metadata.num_references,
-            (long long)metadata.ref0,
-            (long long)metadata.ref1,
-            (long long)metadata.ref2,
-            (long long)metadata.ref3,
-            (long long)metadata.ref4,
+            (size_t)metadata.num_references, (long long)metadata.ref0,
+            (long long)metadata.ref1, (long long)metadata.ref2,
+            (long long)metadata.ref3, (long long)metadata.ref4,
             (int)metadata.is_last_spatial_layer,
-            (int)metadata.delayed_by_retransmission,
-            (long long)receive_time_ms, (long long)metadata.render_time_ms,
-            (int)buffer_->CurrentSize(),
+            (int)metadata.delayed_by_retransmission, (long long)receive_time_ms,
+            (long long)metadata.render_time_ms, (int)buffer_->CurrentSize(),
             (int)buffer_->GetTotalNumberOfContinuousTemporalUnits(),
             (int)buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
             (int)inserted, drop_reason);
   }
+  LogEffectivePlayoutBudget(clock_, timing_, *buffer_, *frame_decode_scheduler_,
+                            "insert", last_frame_ready_render_time_ms_);
   if (inserted) {
     RTC_DCHECK(metadata.receive_time) << "Frame receive time must be set!";
     if (!metadata.delayed_by_retransmission && metadata.receive_time &&
@@ -272,13 +408,16 @@ void VideoStreamBufferController::StartNextDecode(bool keyframe_required) {
     timeout_tracker_.SetWaitingForKeyframe();
   }
   decoder_ready_for_new_frame_ = true;
-  if (FILE* f = SchedulerEventsLog()) {
+  if (FILE *f = SchedulerEventsLog()) {
     fprintf(f, "%lld,StartNextDecode,0,1,%d,%d,%d,%d\n",
             (long long)clock_->CurrentTime().ms(), (int)keyframe_required_,
             (int)buffer_->CurrentSize(),
             (int)buffer_->GetTotalNumberOfContinuousTemporalUnits(),
             (int)buffer_->GetNumberOfBufferedContinuousTemporalUnits());
   }
+  LogEffectivePlayoutBudget(clock_, timing_, *buffer_, *frame_decode_scheduler_,
+                            "start_next_decode",
+                            last_frame_ready_render_time_ms_);
   MaybeScheduleFrameForRelease();
 }
 
@@ -299,7 +438,7 @@ void VideoStreamBufferController::OnFrameReady(
   Timestamp now = clock_->CurrentTime();
   bool superframe_delayed_by_retransmission = false;
   DataSize superframe_size = DataSize::Zero();
-  const EncodedFrame& first_frame = *frames.front();
+  const EncodedFrame &first_frame = *frames.front();
   Timestamp min_receive_time = MinReceiveTime(first_frame);
   Timestamp max_receive_time = ReceiveTime(first_frame);
 
@@ -317,7 +456,7 @@ void VideoStreamBufferController::OnFrameReady(
     render_time = timing_->RenderTime(first_frame.RtpTimestamp(), now);
   }
 
-  for (std::unique_ptr<EncodedFrame>& frame : frames) {
+  for (std::unique_ptr<EncodedFrame> &frame : frames) {
     frame->SetRenderTime(render_time.ms());
 
     superframe_delayed_by_retransmission |= frame->delayed_by_retransmission();
@@ -354,19 +493,23 @@ void VideoStreamBufferController::OnFrameReady(
   timing_->SetLastDecodeScheduledTimestamp(now);
 
   decoder_ready_for_new_frame_ = false;
-  if (FILE* f = SchedulerEventsLog()) {
+  last_frame_ready_render_time_ms_ = render_time.ms();
+  if (FILE *f = SchedulerEventsLog()) {
     fprintf(f, "%lld,OnFrameReady,0,0,%d,%d,%d,%d\n",
             (long long)clock_->CurrentTime().ms(), (int)keyframe_required_,
             (int)buffer_->CurrentSize(),
             (int)buffer_->GetTotalNumberOfContinuousTemporalUnits(),
             (int)buffer_->GetNumberOfBufferedContinuousTemporalUnits());
   }
+  LogEffectivePlayoutBudget(clock_, timing_, *buffer_, *frame_decode_scheduler_,
+                            "frame_ready",
+                            last_frame_ready_render_time_ms_);
   receiver_->OnEncodedFrame(std::move(frame));
 }
 
 void VideoStreamBufferController::OnTimeout(TimeDelta delay) {
   RTC_DCHECK_RUN_ON(&worker_sequence_checker_);
-  if (FILE* f = SchedulerEventsLog()) {
+  if (FILE *f = SchedulerEventsLog()) {
     fprintf(f, "%lld,OnTimeout,0,%d,%d,%d,%d,%d\n",
             (long long)clock_->CurrentTime().ms(),
             (int)decoder_ready_for_new_frame_, (int)keyframe_required_,
@@ -393,6 +536,14 @@ void VideoStreamBufferController::FrameReadyForDecode(uint32_t rtp_timestamp,
   // decoding.
   auto decodable_tu_info = buffer_->DecodableTemporalUnitsInfo();
   if (!decodable_tu_info) {
+    LogDecodeSchedule(clock_, "release_no_decodable", rtp_timestamp, -1,
+                      render_time.ms_or(-1), -1, -1, -1,
+                      frame_decode_scheduler_->ScheduledRtpTimestamp(),
+                      decoder_ready_for_new_frame_, keyframe_required_,
+                      buffer_->CurrentSize(),
+                      buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+                      buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+                      IsTooManyFramesQueued(), 0, 0);
     RTC_LOG(LS_ERROR)
         << "The frame buffer became undecodable during the wait "
            "to decode frame with rtp-timestamp "
@@ -404,14 +555,39 @@ void VideoStreamBufferController::FrameReadyForDecode(uint32_t rtp_timestamp,
   RTC_DCHECK_EQ(rtp_timestamp, decodable_tu_info->next_rtp_timestamp)
       << "Frame buffer's next decodable frame was not the one sent for "
          "extraction.";
+  LogDecodeSchedule(
+      clock_, "release_start", rtp_timestamp,
+      decodable_tu_info->last_rtp_timestamp, render_time.ms_or(-1), -1, -1, -1,
+      frame_decode_scheduler_->ScheduledRtpTimestamp(),
+      decoder_ready_for_new_frame_, keyframe_required_, buffer_->CurrentSize(),
+      buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+      buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+      IsTooManyFramesQueued(), 0, 0);
   auto frames = buffer_->ExtractNextDecodableTemporalUnit();
   if (frames.empty()) {
+    LogDecodeSchedule(clock_, "release_empty", rtp_timestamp,
+                      decodable_tu_info->last_rtp_timestamp,
+                      render_time.ms_or(-1), -1, -1, -1,
+                      frame_decode_scheduler_->ScheduledRtpTimestamp(),
+                      decoder_ready_for_new_frame_, keyframe_required_,
+                      buffer_->CurrentSize(),
+                      buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+                      buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+                      IsTooManyFramesQueued(), 0, 0);
     RTC_LOG(LS_ERROR)
         << "The frame buffer should never return an empty temporal until list "
            "when there is a decodable temporal unit.";
     RTC_DCHECK_NOTREACHED();
     return;
   }
+  LogDecodeSchedule(
+      clock_, "release_extracted", rtp_timestamp,
+      decodable_tu_info->last_rtp_timestamp, render_time.ms_or(-1), -1, -1, -1,
+      frame_decode_scheduler_->ScheduledRtpTimestamp(),
+      decoder_ready_for_new_frame_, keyframe_required_, buffer_->CurrentSize(),
+      buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+      buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+      IsTooManyFramesQueued(), static_cast<int>(frames.size()), 0);
   OnFrameReady(std::move(frames), render_time);
 }
 
@@ -426,8 +602,7 @@ void VideoStreamBufferController::UpdateDroppedFrames()
 }
 
 void VideoStreamBufferController::UpdateFrameBufferTimings(
-    Timestamp min_receive_time,
-    Timestamp now) {
+    Timestamp min_receive_time, Timestamp now) {
   // Update instantaneous delays.
   auto timings = timing_->GetTimings();
   if (timings.num_decoded_frames) {
@@ -482,9 +657,12 @@ void VideoStreamBufferController::ForceKeyFrameReleaseImmediately()
 void VideoStreamBufferController::MaybeScheduleFrameForRelease()
     RTC_RUN_ON(&worker_sequence_checker_) {
   auto decodable_tu_info = buffer_->DecodableTemporalUnitsInfo();
-  auto log_event = [&](const char* reason,
+  LogEffectivePlayoutBudget(clock_, timing_, *buffer_, *frame_decode_scheduler_,
+                            "maybe_schedule",
+                            last_frame_ready_render_time_ms_);
+  auto log_event = [&](const char *reason,
                        int drops) RTC_NO_THREAD_SAFETY_ANALYSIS {
-    if (FILE* f = SchedulerEventsLog()) {
+    if (FILE *f = SchedulerEventsLog()) {
       fprintf(f, "%lld,MSFR_%s,%d,%d,%d,%d,%d,%d\n",
               (long long)clock_->CurrentTime().ms(), reason, drops,
               (int)decoder_ready_for_new_frame_, (int)keyframe_required_,
@@ -495,15 +673,45 @@ void VideoStreamBufferController::MaybeScheduleFrameForRelease()
   };
   if (!decoder_ready_for_new_frame_) {
     log_event("notready", 0);
+    LogDecodeSchedule(
+        clock_, "msfr_notready",
+        decodable_tu_info
+            ? static_cast<int64_t>(decodable_tu_info->next_rtp_timestamp)
+            : -1,
+        decodable_tu_info
+            ? static_cast<int64_t>(decodable_tu_info->last_rtp_timestamp)
+            : -1,
+        -1, -1, -1, -1, frame_decode_scheduler_->ScheduledRtpTimestamp(),
+        decoder_ready_for_new_frame_, keyframe_required_,
+        buffer_->CurrentSize(),
+        buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+        buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+        IsTooManyFramesQueued(), 0, 0);
     return;
   }
   if (!decodable_tu_info) {
     log_event("nodecodable", 0);
+    LogDecodeSchedule(clock_, "msfr_nodecodable", -1, -1, -1, -1, -1, -1,
+                      frame_decode_scheduler_->ScheduledRtpTimestamp(),
+                      decoder_ready_for_new_frame_, keyframe_required_,
+                      buffer_->CurrentSize(),
+                      buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+                      buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+                      IsTooManyFramesQueued(), 0, 0);
     return;
   }
 
   if (keyframe_required_) {
     log_event("forcekey", 0);
+    LogDecodeSchedule(clock_, "msfr_forcekey",
+                      decodable_tu_info->next_rtp_timestamp,
+                      decodable_tu_info->last_rtp_timestamp, -1, -1, -1, -1,
+                      frame_decode_scheduler_->ScheduledRtpTimestamp(),
+                      decoder_ready_for_new_frame_, keyframe_required_,
+                      buffer_->CurrentSize(),
+                      buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+                      buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+                      IsTooManyFramesQueued(), 0, 0);
     return ForceKeyFrameReleaseImmediately();
   }
 
@@ -511,6 +719,15 @@ void VideoStreamBufferController::MaybeScheduleFrameForRelease()
   if (frame_decode_scheduler_->ScheduledRtpTimestamp() ==
       decodable_tu_info->next_rtp_timestamp) {
     log_event("scheduled", 0);
+    LogDecodeSchedule(clock_, "msfr_already_scheduled",
+                      decodable_tu_info->next_rtp_timestamp,
+                      decodable_tu_info->last_rtp_timestamp, -1, -1, -1, -1,
+                      frame_decode_scheduler_->ScheduledRtpTimestamp(),
+                      decoder_ready_for_new_frame_, keyframe_required_,
+                      buffer_->CurrentSize(),
+                      buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+                      buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+                      IsTooManyFramesQueued(), 0, 0);
     return;
   }
 
@@ -520,10 +737,11 @@ void VideoStreamBufferController::MaybeScheduleFrameForRelease()
   max_wait = std::max(max_wait - TimeDelta::Millis(1), TimeDelta::Zero());
   std::optional<FrameDecodeTiming::FrameSchedule> schedule;
   while (decodable_tu_info) {
+    bool too_many_frames_queued = IsTooManyFramesQueued();
     schedule = decode_timing_.OnFrameBufferUpdated(
         decodable_tu_info->next_rtp_timestamp,
         decodable_tu_info->last_rtp_timestamp, max_wait,
-        IsTooManyFramesQueued());
+        too_many_frames_queued);
     if (schedule) {
       // Don't schedule if already waiting for the same frame.
       if (frame_decode_scheduler_->ScheduledRtpTimestamp() !=
@@ -535,13 +753,34 @@ void VideoStreamBufferController::MaybeScheduleFrameForRelease()
                              this));
       }
       log_event("scheduled_new", 0);
+      LogDecodeSchedule(
+          clock_, "msfr_scheduled_new", decodable_tu_info->next_rtp_timestamp,
+          decodable_tu_info->last_rtp_timestamp,
+          schedule->render_time.ms_or(-1),
+          schedule->latest_decode_time.ms_or(-1),
+          (schedule->latest_decode_time - clock_->CurrentTime()).ms_or(-1),
+          max_wait.ms_or(-1), frame_decode_scheduler_->ScheduledRtpTimestamp(),
+          decoder_ready_for_new_frame_, keyframe_required_,
+          buffer_->CurrentSize(),
+          buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+          buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+          too_many_frames_queued, 0, 0);
       return;
     }
     // If no schedule for current rtp, drop and try again.
+    LogDecodeSchedule(
+        clock_, "msfr_drop_no_schedule", decodable_tu_info->next_rtp_timestamp,
+        decodable_tu_info->last_rtp_timestamp, -1, -1, -1, max_wait.ms_or(-1),
+        frame_decode_scheduler_->ScheduledRtpTimestamp(),
+        decoder_ready_for_new_frame_, keyframe_required_,
+        buffer_->CurrentSize(),
+        buffer_->GetTotalNumberOfContinuousTemporalUnits(),
+        buffer_->GetNumberOfBufferedContinuousTemporalUnits(),
+        too_many_frames_queued, 0, 1);
     buffer_->DropNextDecodableTemporalUnit();
     log_event("drop", 1);
     decodable_tu_info = buffer_->DecodableTemporalUnitsInfo();
   }
 }
 
-}  // namespace webrtc
+} // namespace webrtc
