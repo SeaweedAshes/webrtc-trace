@@ -150,15 +150,20 @@ void LogEffectivePlayoutBudget(
     const auto &unit = units[i];
     const Timestamp render_time =
         timing->RenderTime(unit.rtp_timestamp, now);
-    const int64_t render_time_ms = render_time.ms();
-    const int64_t release_deadline_ms = render_time_ms - render_delay_ms;
+    const int64_t render_time_ms = render_time.ms_or(-1);
+    const bool has_valid_render_time = render_time_ms >= 0;
+    const int64_t release_deadline_ms =
+        has_valid_render_time ? render_time_ms - render_delay_ms : -1;
     const int64_t release_deadline_delta_ms =
-        release_deadline_ms - now_ms;
-    const bool future_render_valid = release_deadline_delta_ms > 0;
-    const bool immediate_renderable = release_deadline_delta_ms <= 0;
-    const bool potential_too_old = render_time_ms + 500 < now_ms;
+        has_valid_render_time ? release_deadline_ms - now_ms : -1;
+    const bool future_render_valid =
+        has_valid_render_time && release_deadline_delta_ms > 0;
+    const bool immediate_renderable =
+        has_valid_render_time && release_deadline_delta_ms <= 0;
+    const bool potential_too_old =
+        has_valid_render_time && render_time_ms + 500 < now_ms;
     const bool potential_out_of_order =
-        last_frame_ready_render_time_ms > 0 &&
+        has_valid_render_time && last_frame_ready_render_time_ms > 0 &&
         render_time_ms < last_frame_ready_render_time_ms;
 
     future_render_valid_units += future_render_valid ? 1 : 0;
