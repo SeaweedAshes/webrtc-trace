@@ -16,7 +16,7 @@ RUN_ID=""
 RECEIVER_HOST=""
 TRACE_PATH=""
 TRACE_IFACE=""
-TRACE_START_DELAY_SEC=4
+TRACE_START_DELAY_SEC=30
 SYSTEM_LOG=1
 SYSTEM_INTERVAL_SEC=1
 
@@ -29,6 +29,7 @@ Options:
   --trace PATH                netem trace CSV to replay on sender egress
   --trace-iface IFACE         Sender egress interface; default auto via ip route get
   --trace-start-delay-sec N   Wait N seconds after sender client starts before replay (default: $TRACE_START_DELAY_SEC)
+                              Use this ramp-up period to avoid locking GCC at low resolution.
   --run-date YYYYMMDD         Shared run date directory (default: today's local date)
   --run-id ID                 Shared run id
   --repo-url URL              Trace repo URL (default: $REPO_URL)
