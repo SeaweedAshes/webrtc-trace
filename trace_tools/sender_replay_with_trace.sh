@@ -122,7 +122,7 @@ ensure_repo_and_build() {
     git fetch --all --prune
     if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
       git checkout "$BRANCH"
-      git pull --ff-only
+      git pull --ff-only origin "$BRANCH"
     fi
     chmod +x trace_tools/*.sh
     ./trace_tools/bootstrap_trace_lab.sh \
