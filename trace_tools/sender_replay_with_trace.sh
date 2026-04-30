@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/SeaweedAshes/webrtc-trace.git"
-BRANCH="main"
+BRANCH="${WEBRTC_TRACE_BRANCH:-}"
 REPO_DIR="$HOME/webrtc-trace"
 WORKDIR="$HOME/webrtc-trace-bootstrap"
 LOG_ROOT="$HOME/webrtc-logs-send"
@@ -33,7 +33,7 @@ Options:
   --run-date YYYYMMDD         Shared run date directory (default: today's local date)
   --run-id ID                 Shared run id
   --repo-url URL              Trace repo URL (default: $REPO_URL)
-  --branch NAME               Git branch (default: $BRANCH)
+  --branch NAME               Git branch (default: current repo branch, or origin default on fresh clone)
   --repo-dir PATH             Local repo checkout path (default: $REPO_DIR)
   --workdir PATH              Bootstrap workdir (default: $WORKDIR)
   --log-root PATH             Sender log root (default: $LOG_ROOT)
@@ -111,6 +111,14 @@ ensure_repo_and_build() {
   fi
   (
     cd "$REPO_DIR"
+    if [[ -z "$BRANCH" ]]; then
+      BRANCH="$(git branch --show-current)"
+      if [[ -z "$BRANCH" ]]; then
+        BRANCH="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+      fi
+      BRANCH="${BRANCH:-main}"
+    fi
+    log "using repo branch $BRANCH"
     git fetch --all --prune
     if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
       git checkout "$BRANCH"

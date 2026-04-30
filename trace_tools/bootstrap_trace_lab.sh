@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_URL=""
-BRANCH="main"
+BRANCH="${WEBRTC_TRACE_BRANCH:-}"
 WORKDIR="$HOME/webrtc-trace-lab-repo"
 DEPOT_TOOLS_DIR="${DEPOT_TOOLS_DIR:-$HOME/depot_tools}"
 BUILD_DIR="out/Trace"
@@ -24,7 +24,7 @@ Required:
   --repo-url URL              Git repository containing the trace-lab checkout
 
 Options:
-  --branch NAME               Git branch to checkout/update (default: main)
+  --branch NAME               Git branch to checkout/update (default: current repo branch, or origin default on fresh clone)
   --workdir PATH              Local clone/update path (default: $WORKDIR)
   --depot-tools-dir PATH      depot_tools location (default: $DEPOT_TOOLS_DIR)
   --build-dir PATH            GN output dir under src/ (default: out/Trace)
@@ -115,6 +115,12 @@ parse_args() {
 
   [[ -n "$REPO_URL" ]] || usage
   [[ -n "$GN_ARGS_TEXT" ]] || GN_ARGS_TEXT="$DEFAULT_GN_ARGS"
+  if [[ -z "$BRANCH" && -d "$SCRIPT_DIR/../.git" ]]; then
+    BRANCH="$(git -C "$SCRIPT_DIR/.." branch --show-current)"
+  fi
+  if [[ -z "$BRANCH" ]]; then
+    BRANCH="main"
+  fi
 }
 
 ensure_depot_tools() {
