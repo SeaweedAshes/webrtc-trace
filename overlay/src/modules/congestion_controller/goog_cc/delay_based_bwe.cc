@@ -47,6 +47,10 @@ constexpr TimeDelta kSendTimeGroupLength = TimeDelta::Millis(5);
 // This ssrc is used to fulfill the current API but will be removed
 // after the API has been changed.
 constexpr uint32_t kFixedSsrc = 0;
+
+int64_t TimestampMsOrMinusOne(Timestamp timestamp) {
+  return timestamp.IsFinite() ? timestamp.ms() : -1;
+}
 }  // namespace
 
 BweSeparateAudioPacketsSettings::BweSeparateAudioPacketsSettings(
@@ -119,6 +123,70 @@ DelayBasedBwe::Result DelayBasedBwe::IncomingPacketFeedbackVector(
                               BweNames::kBweNamesMax);
     uma_recorded_ = true;
   }
+
+  ++current_feedback_batch_id_;
+  {
+    const int64_t feedback_batch_id = current_feedback_batch_id_;
+    const std::vector<PacketResult> received = msg.ReceivedWithSendInfo();
+    const std::vector<PacketResult> lost = msg.LostWithSendInfo();
+    int received_audio = 0;
+    int received_video = 0;
+    int lost_audio = 0;
+    int lost_video = 0;
+    Timestamp first_send_time = Timestamp::PlusInfinity();
+    Timestamp last_send_time = Timestamp::MinusInfinity();
+    Timestamp first_recv_time = Timestamp::PlusInfinity();
+    Timestamp last_recv_time = Timestamp::MinusInfinity();
+
+    for (const auto& feedback : msg.packet_feedbacks) {
+      first_send_time =
+          std::min(first_send_time, feedback.sent_packet.send_time);
+      last_send_time = std::max(last_send_time, feedback.sent_packet.send_time);
+      if (feedback.IsReceived()) {
+        first_recv_time = std::min(first_recv_time, feedback.receive_time);
+        last_recv_time = std::max(last_recv_time, feedback.receive_time);
+      }
+    }
+    for (const auto& feedback : received) {
+      if (feedback.sent_packet.audio) {
+        ++received_audio;
+      } else {
+        ++received_video;
+      }
+    }
+    for (const auto& feedback : lost) {
+      if (feedback.sent_packet.audio) {
+        ++lost_audio;
+      } else {
+        ++lost_video;
+      }
+    }
+
+    static FILE* batch_log = rtc::OpenCsvLog(
+        "transport_feedback_batch.csv",
+        "feedback_batch_id,feedback_time_ms,total_packet_feedbacks,"
+        "received_with_send_info,lost_with_send_info,sorted_by_receive_time,"
+        "received_audio,received_video,lost_audio,lost_video,"
+        "first_send_time_ms,last_send_time_ms,first_recv_time_ms,"
+        "last_recv_time_ms,data_in_flight_bytes,has_ecn_ce\n");
+    if (batch_log) {
+      fprintf(batch_log,
+              "%lld,%lld,%zu,%zu,%zu,%zu,%d,%d,%d,%d,%lld,%lld,%lld,%lld,%lld,"
+              "%d\n",
+              (long long)feedback_batch_id,
+              (long long)TimestampMsOrMinusOne(msg.feedback_time),
+              msg.packet_feedbacks.size(), received.size(), lost.size(),
+              packet_feedback_vector.size(), received_audio, received_video,
+              lost_audio, lost_video,
+              (long long)TimestampMsOrMinusOne(first_send_time),
+              (long long)TimestampMsOrMinusOne(last_send_time),
+              (long long)TimestampMsOrMinusOne(first_recv_time),
+              (long long)TimestampMsOrMinusOne(last_recv_time),
+              (long long)msg.data_in_flight.bytes(),
+              (int)msg.HasPacketWithEcnCe());
+    }
+  }
+
   bool delayed_feedback = true;
   bool recovered_from_overuse = false;
   BandwidthUsage prev_detector_state = active_delay_detector_->State();
@@ -205,9 +273,10 @@ void DelayBasedBwe::IncomingPacketFeedback(const PacketResult& packet_feedback,
     static FILE* pf_log = rtc::OpenCsvLog(
         "packet_feedback.csv",
         "at_time_ms,send_time_ms,recv_time_ms,"
-        "send_delta_ms,recv_delta_ms,calculated,is_audio,size_bytes\n");
+        "send_delta_ms,recv_delta_ms,calculated,is_audio,size_bytes,"
+        "feedback_batch_id\n");
     if (pf_log) {
-      fprintf(pf_log, "%lld,%lld,%lld,%.3f,%.3f,%d,%d,%lld\n",
+      fprintf(pf_log, "%lld,%lld,%lld,%.3f,%.3f,%d,%d,%lld,%lld\n",
               (long long)at_time.ms(),
               (long long)packet_feedback.sent_packet.send_time.ms(),
               (long long)packet_feedback.receive_time.ms(),
@@ -215,7 +284,47 @@ void DelayBasedBwe::IncomingPacketFeedback(const PacketResult& packet_feedback,
               calculated_deltas ? recv_delta.ms<double>() : 0.0,
               (int)calculated_deltas,
               (int)packet_feedback.sent_packet.audio,
-              (long long)packet_size.bytes());
+              (long long)packet_size.bytes(),
+              (long long)current_feedback_batch_id_);
+    }
+  }
+  {
+    const TrendlineEstimator* trendline_detector =
+        static_cast<const TrendlineEstimator*>(delay_detector_for_packet);
+    static FILE* trendline_log = rtc::OpenCsvLog(
+        "gcc_trendline.csv",
+        "feedback_batch_id,at_time_ms,send_time_ms,recv_time_ms,"
+        "send_delta_ms,recv_delta_ms,delay_delta_ms,calculated,is_audio,"
+        "size_bytes,num_deltas,window_size,delay_hist_size,trend_slope,"
+        "modified_trend,threshold,accumulated_delay_ms,smoothed_delay_ms,"
+        "time_over_using_ms,overuse_counter,detector_state,active_detector\n");
+    if (trendline_log) {
+      fprintf(trendline_log,
+              "%lld,%lld,%lld,%lld,%.3f,%.3f,%.3f,%d,%d,%lld,%d,%u,%zu,%.9f,"
+              "%.9f,%.9f,%.9f,%.9f,%.3f,%d,%d,%d\n",
+              (long long)current_feedback_batch_id_, (long long)at_time.ms(),
+              (long long)packet_feedback.sent_packet.send_time.ms(),
+              (long long)packet_feedback.receive_time.ms(),
+              calculated_deltas ? send_delta.ms<double>() : 0.0,
+              calculated_deltas ? recv_delta.ms<double>() : 0.0,
+              calculated_deltas
+                  ? (recv_delta.ms<double>() - send_delta.ms<double>())
+                  : 0.0,
+              (int)calculated_deltas,
+              (int)packet_feedback.sent_packet.audio,
+              (long long)packet_size.bytes(),
+              trendline_detector->num_of_deltas(),
+              trendline_detector->window_size(),
+              trendline_detector->delay_hist_size(),
+              trendline_detector->prev_trend(),
+              trendline_detector->prev_modified_trend(),
+              trendline_detector->threshold(),
+              trendline_detector->accumulated_delay_ms(),
+              trendline_detector->smoothed_delay_ms(),
+              trendline_detector->time_over_using_ms(),
+              trendline_detector->overuse_counter(),
+              (int)trendline_detector->State(),
+              (int)(delay_detector_for_packet == active_delay_detector_));
     }
   }
 }

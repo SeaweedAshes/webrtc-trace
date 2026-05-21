@@ -10,7 +10,7 @@ DEPOT_TOOLS_DIR="${DEPOT_TOOLS_DIR:-$HOME/depot_tools}"
 BUILD_DIR="out/Trace"
 TARGETS=("peerconnection_client" "peerconnection_server" "rtc_unittests")
 SYNC_ARGS=("--nohooks" "--jobs" "1")
-DEFAULT_GN_ARGS=$'rtc_build_examples = true\nrtc_include_tests = true\nis_debug = false\nuse_sysroot = false'
+DEFAULT_GN_ARGS=$'rtc_build_examples = true\nrtc_include_tests = true\nis_debug = false\nuse_sysroot = false\ntreat_warnings_as_errors = false'
 GN_ARGS_TEXT=""
 SKIP_BUILD=0
 FORCE_GCLIENT_SYNC=0
