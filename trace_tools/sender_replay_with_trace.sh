@@ -17,12 +17,21 @@ RECEIVER_HOST=""
 TRACE_PATH=""
 TRACE_IFACE=""
 TRACE_START_DELAY_SEC=30
+MEDIA_SPLIT="none"
+AUDIO_TRACE_PATH=""
+VIDEO_TRACE_PATH=""
+AUDIO_DELAY_MS=0
+VIDEO_DELAY_MS=0
+AUDIO_SSRC=""
+VIDEO_SSRC=""
+SSRC_WAIT_SEC=20
 SYSTEM_LOG=1
 SYSTEM_INTERVAL_SEC=1
 
 usage() {
   cat <<EOF
 Usage: $0 --receiver-host HOST --trace PATH [options]
+       $0 --receiver-host HOST --media-split ssrc [--trace PATH|--video-trace PATH] [options]
 
 Options:
   --receiver-host HOST        Receiver machine IP/hostname that hosts signaling
@@ -30,6 +39,14 @@ Options:
   --trace-iface IFACE         Sender egress interface; default auto via ip route get
   --trace-start-delay-sec N   Wait N seconds after sender client starts before replay (default: $TRACE_START_DELAY_SEC)
                               Use this ramp-up period to avoid locking GCC at low resolution.
+  --media-split MODE          none|ssrc. If ssrc, classify RTP by live audio/video SSRC.
+  --audio-trace PATH          Audio netem trace CSV for --media-split ssrc
+  --video-trace PATH          Video netem trace CSV for --media-split ssrc (default: --trace)
+  --audio-delay-ms N          Fixed audio delay when --audio-trace is omitted (default: $AUDIO_DELAY_MS)
+  --video-delay-ms N          Fixed video delay when --video-trace and --trace are omitted (default: $VIDEO_DELAY_MS)
+  --audio-ssrc LIST           Comma-separated audio SSRC list; default auto from live rtp_send.csv
+  --video-ssrc LIST           Comma-separated video SSRC list; default auto from live rtp_send.csv
+  --ssrc-wait-sec N           Max seconds to wait for live SSRC discovery (default: $SSRC_WAIT_SEC)
   --run-date YYYYMMDD         Shared run date directory (default: today's local date)
   --run-id ID                 Shared run id
   --repo-url URL              Trace repo URL (default: $REPO_URL)
@@ -64,6 +81,14 @@ parse_args() {
       --trace) TRACE_PATH="$2"; shift 2 ;;
       --trace-iface) TRACE_IFACE="$2"; shift 2 ;;
       --trace-start-delay-sec) TRACE_START_DELAY_SEC="$2"; shift 2 ;;
+      --media-split) MEDIA_SPLIT="$2"; shift 2 ;;
+      --audio-trace) AUDIO_TRACE_PATH="$2"; shift 2 ;;
+      --video-trace) VIDEO_TRACE_PATH="$2"; shift 2 ;;
+      --audio-delay-ms) AUDIO_DELAY_MS="$2"; shift 2 ;;
+      --video-delay-ms) VIDEO_DELAY_MS="$2"; shift 2 ;;
+      --audio-ssrc) AUDIO_SSRC="$2"; shift 2 ;;
+      --video-ssrc) VIDEO_SSRC="$2"; shift 2 ;;
+      --ssrc-wait-sec) SSRC_WAIT_SEC="$2"; shift 2 ;;
       --run-date) RUN_DATE="$2"; shift 2 ;;
       --run-id) RUN_ID="$2"; shift 2 ;;
       --repo-url) REPO_URL="$2"; shift 2 ;;
@@ -83,8 +108,21 @@ parse_args() {
   done
 
   [[ -n "$RECEIVER_HOST" ]] || usage
-  [[ -n "$TRACE_PATH" ]] || usage
-  [[ -f "$TRACE_PATH" ]] || die "trace file not found: $TRACE_PATH"
+  [[ "$MEDIA_SPLIT" =~ ^(none|ssrc)$ ]] || die "media-split must be none or ssrc"
+  if [[ "$MEDIA_SPLIT" == "none" ]]; then
+    [[ -n "$TRACE_PATH" ]] || usage
+    [[ -f "$TRACE_PATH" ]] || die "trace file not found: $TRACE_PATH"
+  else
+    if [[ -z "$VIDEO_TRACE_PATH" && -n "$TRACE_PATH" ]]; then
+      VIDEO_TRACE_PATH="$TRACE_PATH"
+    fi
+    if [[ -n "$AUDIO_TRACE_PATH" ]]; then
+      [[ -f "$AUDIO_TRACE_PATH" ]] || die "audio trace file not found: $AUDIO_TRACE_PATH"
+    fi
+    if [[ -n "$VIDEO_TRACE_PATH" ]]; then
+      [[ -f "$VIDEO_TRACE_PATH" ]] || die "video trace file not found: $VIDEO_TRACE_PATH"
+    fi
+  fi
   if [[ -n "$DURATION_MIN" ]]; then
     [[ "$DURATION_MIN" =~ ^[0-9]+$ ]] || die "duration-min must be numeric"
     DURATION_SEC="$((DURATION_MIN * 60))"
@@ -92,6 +130,9 @@ parse_args() {
   [[ "$DURATION_SEC" =~ ^[0-9]+$ ]] || die "duration-sec must be numeric"
   (( DURATION_SEC > 0 )) || die "duration must be greater than zero"
   [[ "$TRACE_START_DELAY_SEC" =~ ^[0-9]+$ ]] || die "trace-start-delay-sec must be numeric"
+  [[ "$AUDIO_DELAY_MS" =~ ^[0-9]+$ ]] || die "audio-delay-ms must be numeric"
+  [[ "$VIDEO_DELAY_MS" =~ ^[0-9]+$ ]] || die "video-delay-ms must be numeric"
+  [[ "$SSRC_WAIT_SEC" =~ ^[0-9]+$ ]] || die "ssrc-wait-sec must be numeric"
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be numeric"
   [[ "$SYSTEM_LOG" =~ ^(0|1)$ ]] || die "system-log must be 0 or 1"
   [[ "$SYSTEM_INTERVAL_SEC" =~ ^[0-9]+$ ]] || die "system-interval-sec must be numeric"
@@ -134,6 +175,56 @@ ensure_repo_and_build() {
 
 latest_log_dir() {
   find "$1" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1
+}
+
+extract_ssrcs_from_rtp_send() {
+  local rtp_send="$1"
+  local is_audio="$2"
+  awk -F, -v is_audio="$is_audio" '
+    NR > 1 && $2 ~ /^[0-9]+$/ && $7 == is_audio {
+      if (!seen[$2]++) {
+        out = out sep $2
+        sep = ","
+      }
+    }
+    END { print out }
+  ' "$rtp_send"
+}
+
+wait_for_live_ssrcs() {
+  local deadline=$((SECONDS + SSRC_WAIT_SEC))
+  local latest_dir=""
+  local rtp_send=""
+  local audio_auto=""
+  local video_auto=""
+
+  while (( SECONDS <= deadline )); do
+    latest_dir="$(latest_log_dir "$LOG_ROOT" 2>/dev/null || true)"
+    rtp_send="$latest_dir/rtp_send.csv"
+    if [[ -f "$rtp_send" ]]; then
+      if [[ -z "$AUDIO_SSRC" ]]; then
+        audio_auto="$(extract_ssrcs_from_rtp_send "$rtp_send" 1)"
+      else
+        audio_auto="$AUDIO_SSRC"
+      fi
+      if [[ -z "$VIDEO_SSRC" ]]; then
+        video_auto="$(extract_ssrcs_from_rtp_send "$rtp_send" 0)"
+      else
+        video_auto="$VIDEO_SSRC"
+      fi
+      if [[ -n "$audio_auto" && -n "$video_auto" ]]; then
+        AUDIO_SSRC="$audio_auto"
+        VIDEO_SSRC="$video_auto"
+        log "live rtp_send=$rtp_send"
+        log "audio_ssrc=$AUDIO_SSRC"
+        log "video_ssrc=$VIDEO_SSRC"
+        return
+      fi
+    fi
+    sleep 1
+  done
+
+  die "could not discover live audio/video SSRCs within ${SSRC_WAIT_SEC}s; pass --audio-ssrc and --video-ssrc explicitly"
 }
 
 resolve_trace_iface() {
@@ -195,6 +286,7 @@ main() {
   mkdir -p "$LOG_ROOT" "$RUN_ROOT"
   log "receiver=$RECEIVER_HOST port=$PORT"
   log "trace=$TRACE_PATH"
+  log "media_split=$MEDIA_SPLIT"
   log "trace_iface=$TRACE_IFACE_RESOLVED"
   log "run_root=$RUN_ROOT"
 
@@ -224,11 +316,32 @@ main() {
 
   sleep "$TRACE_START_DELAY_SEC"
   log "starting trace replay after ${TRACE_START_DELAY_SEC}s"
-  python3 "$REPO_DIR/trace_tools/replay_netem_trace.py" \
-    --trace "$TRACE_PATH" \
-    --iface "$TRACE_IFACE_RESOLVED" \
-    --sudo \
-    --reset-at-end > "$trace_log" 2>&1 &
+  if [[ "$MEDIA_SPLIT" == "ssrc" ]]; then
+    wait_for_live_ssrcs
+    replay_cmd=(
+      python3 "$REPO_DIR/trace_tools/replay_media_netem_trace.py"
+      --iface "$TRACE_IFACE_RESOLVED"
+      --audio-ssrc "$AUDIO_SSRC"
+      --video-ssrc "$VIDEO_SSRC"
+      --audio-delay-ms "$AUDIO_DELAY_MS"
+      --video-delay-ms "$VIDEO_DELAY_MS"
+      --sudo
+      --reset-at-end
+    )
+    if [[ -n "$AUDIO_TRACE_PATH" ]]; then
+      replay_cmd+=(--audio-trace "$AUDIO_TRACE_PATH")
+    fi
+    if [[ -n "$VIDEO_TRACE_PATH" ]]; then
+      replay_cmd+=(--video-trace "$VIDEO_TRACE_PATH")
+    fi
+    "${replay_cmd[@]}" > "$trace_log" 2>&1 &
+  else
+    python3 "$REPO_DIR/trace_tools/replay_netem_trace.py" \
+      --trace "$TRACE_PATH" \
+      --iface "$TRACE_IFACE_RESOLVED" \
+      --sudo \
+      --reset-at-end > "$trace_log" 2>&1 &
+  fi
   TRACE_PID=$!
 
   local client_status=0
@@ -263,6 +376,13 @@ main() {
   cat > "$run_dir/REPLAY_INFO.txt" <<EOF
 receiver_host=$RECEIVER_HOST
 trace=$TRACE_PATH
+media_split=$MEDIA_SPLIT
+audio_trace=$AUDIO_TRACE_PATH
+video_trace=$VIDEO_TRACE_PATH
+audio_delay_ms=$AUDIO_DELAY_MS
+video_delay_ms=$VIDEO_DELAY_MS
+audio_ssrc=$AUDIO_SSRC
+video_ssrc=$VIDEO_SSRC
 trace_iface=$TRACE_IFACE_RESOLVED
 trace_start_delay_sec=$TRACE_START_DELAY_SEC
 run_date=$RUN_DATE
