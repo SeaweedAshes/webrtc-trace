@@ -148,6 +148,49 @@ csv_bytes_in_dir() {
   find "$1" -maxdepth 1 -type f -name '*.csv' -printf '%s\n' | awk '{s += $1} END {print s + 0}'
 }
 
+csv_file_span_sec() {
+  awk -F, '
+    NR > 1 && $1 ~ /^-?[0-9]+$/ {
+      if (!seen) {
+        first = $1
+        seen = 1
+      }
+      last = $1
+    }
+    END {
+      if (seen) {
+        printf "%d\n", (last - first) / 1000
+      } else {
+        print 0
+      }
+    }
+  ' "$1"
+}
+
+csv_media_span_sec_in_dir() {
+  local dir="$1"
+  local best=0
+  local name
+  local span
+  for name in audio_packet_inserts.csv packet_buffer_inserts.csv receiver_rendered_frames.csv rtp_send.csv; do
+    if [[ -f "$dir/$name" ]]; then
+      span="$(csv_file_span_sec "$dir/$name")"
+      if (( span > best )); then
+        best="$span"
+      fi
+    fi
+  done
+  printf '%s\n' "$best"
+}
+
+minimum_acceptable_span_sec() {
+  if (( DURATION_SEC > 300 )); then
+    printf '%s\n' "$((DURATION_SEC - 120))"
+  else
+    printf '%s\n' "$((DURATION_SEC / 2))"
+  fi
+}
+
 best_new_log_dir() {
   local log_root="$1"
   local before_file="$2"
@@ -242,13 +285,21 @@ main() {
     wait "$system_pid" 2>/dev/null || true
   fi
 
-  if [[ "$client_status" -ne 0 && "$client_status" -ne 124 ]]; then
-    die "sender client exited with status $client_status; check $client_log"
-  fi
-
   latest_dir="$(best_new_log_dir "$LOG_ROOT" "$before_dirs_file")"
   rm -f "$before_dirs_file"
   [[ -n "$latest_dir" ]] || die "no sender log directory found under $LOG_ROOT; check $client_log and $server_log"
+
+  local media_span_sec
+  local min_span_sec
+  media_span_sec="$(csv_media_span_sec_in_dir "$latest_dir")"
+  min_span_sec="$(minimum_acceptable_span_sec)"
+  if [[ "$client_status" -ne 0 && "$client_status" -ne 124 ]]; then
+    if (( media_span_sec >= min_span_sec )); then
+      log "WARNING: sender client exited with status $client_status after usable ${media_span_sec}s log span; keeping bundle"
+    else
+      die "sender client exited with status $client_status after only ${media_span_sec}s log span; check $client_log"
+    fi
+  fi
 
   rm -rf "$run_dir"
   mkdir -p "$run_dir"
