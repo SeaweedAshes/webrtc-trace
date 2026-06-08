@@ -140,8 +140,43 @@ ensure_repo_and_build() {
   )
 }
 
-latest_log_dir() {
-  find "$1" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1
+snapshot_log_dirs() {
+  find "$1" -mindepth 1 -maxdepth 1 -type d | sort
+}
+
+csv_bytes_in_dir() {
+  find "$1" -maxdepth 1 -type f -name '*.csv' -printf '%s\n' | awk '{s += $1} END {print s + 0}'
+}
+
+best_new_log_dir() {
+  local log_root="$1"
+  local before_file="$2"
+  local after_file
+  local candidates=()
+  local best_dir=""
+  local best_score=-1
+  local dir
+  local score
+
+  after_file="$(mktemp)"
+  snapshot_log_dirs "$log_root" > "$after_file"
+  mapfile -t candidates < <(comm -13 "$before_file" "$after_file")
+  rm -f "$after_file"
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    mapfile -t candidates < <(snapshot_log_dirs "$log_root")
+  fi
+
+  for dir in "${candidates[@]}"; do
+    [[ -d "$dir" ]] || continue
+    score="$(csv_bytes_in_dir "$dir")"
+    if (( score > best_score )); then
+      best_score="$score"
+      best_dir="$dir"
+    fi
+  done
+
+  printf '%s\n' "$best_dir"
 }
 
 main() {
@@ -160,6 +195,7 @@ main() {
   local client_server_host
   local system_tmp="$run_root/sender_system_tmp"
   local system_pid=""
+  local before_dirs_file
 
   cd "$src_root"
   if [[ "$SIGNAL_SERVER_ROLE" == "sender" ]]; then
@@ -186,6 +222,8 @@ main() {
       > "$system_tmp/collector.log" 2>&1 &
     system_pid=$!
   fi
+  before_dirs_file="$(mktemp)"
+  snapshot_log_dirs "$LOG_ROOT" > "$before_dirs_file"
   local client_status=0
   timeout "$DURATION_SEC" env WEBRTC_LOG_DIR="$LOG_ROOT" \
     xvfb-run -a --server-args="-screen 0 2560x1440x24" \
@@ -208,7 +246,8 @@ main() {
     die "sender client exited with status $client_status; check $client_log"
   fi
 
-  latest_dir="$(latest_log_dir "$LOG_ROOT")"
+  latest_dir="$(best_new_log_dir "$LOG_ROOT" "$before_dirs_file")"
+  rm -f "$before_dirs_file"
   [[ -n "$latest_dir" ]] || die "no sender log directory found under $LOG_ROOT; check $client_log and $server_log"
 
   rm -rf "$run_dir"
