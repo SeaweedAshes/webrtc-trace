@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "trigger": {
+    "mode": "any",
+    "enable_render_gap": true,
+    "enable_packet_gap": true,
+    "enable_frame_decode_gap": true,
+    "enable_playout_headroom": false,
+    "thresholds": {
+      "packet_gap_ms": 120,
+      "frame_decode_gap_ms": 120,
+      "render_gap_ms": 180,
+      "playout_headroom_ms": 0,
+      "min_audio_available_ms": 1000
+    }
+  },
+  "recovery": {
+    "enable_consecutive_real_frames": true,
+    "consecutive_real_frames": 5,
+    "stable_gap_ms": 60,
+    "stable_duration_ms": 200,
+    "enable_crossfade": true,
+    "crossfade_ms": 120
+  },
+  "wav2lip": {
+    "mode": "chunk",
+    "host": "127.0.0.1",
+    "port": 19090,
+    "audio_chunk_ms": 1000,
+    "generated_clip_ms": 1000,
+    "fps": 25,
+    "checkpoint_path": "/home/widen/Wav2Lip/checkpoints/wav2lip_gan.pth",
+    "repo_dir": "/home/widen/Wav2Lip",
+    "face_source": "last_good_rendered_frame"
+  },
+  "display": {
+    "show_raw_video": true,
+    "show_generated_video": true,
+    "show_overlay_metrics": true,
+    "normal_label": "NORMAL_REAL_STREAM",
+    "risk_label": "RISK_PREPARE_GENERATION",
+    "generated_label": "GENERATED_WAV2LIP",
+    "recovery_label": "RECOVERY_TO_REAL_STREAM"
+  },
+  "logging": {
+    "run_root": "/home/widen/webrtc-wav2lip-lab/runtime",
+    "trigger_events": "trigger_events.csv",
+    "concealment_frames": "concealment_frames.csv",
+    "recovery_events": "recovery_events.csv",
+    "wav2lip_requests": "wav2lip_requests.csv"
+  }
+}

@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebRTC Wav2Lip Lab Implementation Log</title>
+  <style>
+    :root {
+      --bg: #f6f2e8;
+      --ink: #1f2a24;
+      --muted: #667068;
+      --line: #d9cfbd;
+      --accent: #b84a32;
+      --panel: #fffaf0;
+      --code: #2d332f;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top left, #fff8df 0, var(--bg) 36rem);
+      color: var(--ink);
+      font: 16px/1.55 "Georgia", "Times New Roman", serif;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 40px 24px 64px;
+    }
+    h1, h2 {
+      line-height: 1.15;
+      margin: 0 0 16px;
+    }
+    h1 {
+      font-size: 38px;
+      letter-spacing: -0.03em;
+    }
+    h2 {
+      margin-top: 36px;
+      color: var(--accent);
+      font-size: 24px;
+    }
+    .lead {
+      max-width: 850px;
+      color: var(--muted);
+      font-size: 18px;
+    }
+    .card {
+      background: color-mix(in srgb, var(--panel) 88%, white);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 22px;
+      box-shadow: 0 18px 45px rgba(52, 43, 31, 0.08);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 14px;
+      background: white;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 12px 14px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #efe3ce;
+      font-weight: 700;
+    }
+    tr:last-child td {
+      border-bottom: 0;
+    }
+    code {
+      padding: 2px 5px;
+      border-radius: 6px;
+      background: #efe7d8;
+      color: var(--code);
+      font-family: "SFMono-Regular", "Consolas", monospace;
+      font-size: 0.92em;
+    }
+    .status {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #e5f2df;
+      color: #315c2b;
+      font-size: 13px;
+      font-family: "SFMono-Regular", "Consolas", monospace;
+    }
+    .warn {
+      background: #fff1cc;
+      color: #735000;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>WebRTC Wav2Lip Lab Implementation Log</h1>
+  <p class="lead">
+    This document records every folder-level modification for the dedicated
+    WebRTC Native + Wav2Lip freeze-concealment system. The trace/replay WebRTC
+    code is intentionally kept separate.
+  </p>
+
+  <section class="card">
+    <h2>Current Design Decisions</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Decision</th>
+          <th>Selected Value</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Native checkout</td>
+          <td><code>~/webrtc-wav2lip-native</code></td>
+          <td>Separate WebRTC tree for Wav2Lip integration only. This avoids contaminating trace/replay experiments.</td>
+        </tr>
+        <tr>
+          <td>Lab directory</td>
+          <td><code>~/webrtc-wav2lip-lab</code></td>
+          <td>Holds scripts, configs, runtime outputs, and documentation outside the native checkout.</td>
+        </tr>
+        <tr>
+          <td>Wav2Lip mode</td>
+          <td>Option 1, chunk-based generation</td>
+          <td>Prioritizes research validation and debugability before optimizing for streaming latency.</td>
+        </tr>
+        <tr>
+          <td>IPC</td>
+          <td>localhost TCP control + local file data path</td>
+          <td>Simple, inspectable, and easy to replace with shared memory later.</td>
+        </tr>
+        <tr>
+          <td>Trigger policy</td>
+          <td>Split generation risk and render switch</td>
+          <td>Generation starts before visible stall: 20 ms monitor, 60 ms render-risk generation, and at least 80 ms missed-render gap before switching to generated frames.</td>
+        </tr>
+        <tr>
+          <td>Recovery policy</td>
+          <td>Stable real-frame return</td>
+          <td>Once generated playback is visible, native waits for 3 consecutive real frames and 120 ms of stable real arrivals before returning to the original stream. Immediate return is still available with an environment variable.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Folder Modifications</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Folder / File</th>
+          <th>Status</th>
+          <th>What Changed</th>
+          <th>Why It Exists</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>~/webrtc-wav2lip-lab/</code></td>
+          <td><span class="status">added</span></td>
+          <td>Created as the top-level lab folder.</td>
+          <td>Keeps Wav2Lip bridge, policies, scripts, docs, and runtime logs separate from WebRTC source code.</td>
+        </tr>
+        <tr>
+          <td><code>~/webrtc-wav2lip-lab/configs/</code></td>
+          <td><span class="status">added</span></td>
+          <td>Added <code>policy.example.json</code>.</td>
+          <td>Makes trigger/recovery thresholds and ON/OFF switches editable without recompiling WebRTC.</td>
+        </tr>
+        <tr>
+          <td><code>~/webrtc-wav2lip-lab/scripts/</code></td>
+          <td><span class="status">updated</span></td>
+          <td>Added TCP server/client, persistent GPU server, smoke test, bootstrap script, and <code>apply_native_overlay.py</code>. The servers write generated PPM frame sequences and report <code>frames_dir</code>/<code>frame_count</code>. The overlay script patches WebRTC <code>main_wnd.h</code>, <code>conductor.h/cc</code>, and Linux <code>main_wnd.h/cc</code> so the native receiver can buffer remote audio, issue Wav2Lip requests on render-gap events, load generated frames, and play them in the GTK render surface.</td>
+          <td>Provides reproducible entry points for Wav2Lip serving and native checkout setup while using the Wav2Lip-specific conda environment by default. The overlay script makes all WebRTC checkout edits explicit, repeatable, idempotent, and easy to reapply after a fresh checkout.</td>
+        </tr>
+        <tr>
+          <td><code>~/webrtc-wav2lip-lab/native_overlay/</code></td>
+          <td><span class="status">updated</span></td>
+          <td>Added C++ bridge/policy skeleton files, recent remote-audio buffer, WAV writer, ARGB frame image writer, and generated PPM frame reader.</td>
+          <td>Stages the WebRTC-side integration without editing the trace/replay checkout. The receiver writes 1 second audio chunks and the last rendered remote frame as Wav2Lip input, then reads generated PPM frames back into the renderer as BGRA images.</td>
+        </tr>
+        <tr>
+          <td><code>~/webrtc-wav2lip-lab/runtime/</code></td>
+          <td><span class="status">added</span></td>
+          <td>Created as output area for request files, generated clips, and CSV logs.</td>
+          <td>Keeps experiment artifacts inspectable and separate from source files.</td>
+        </tr>
+        <tr>
+          <td><code>~/webrtc-wav2lip-native/</code></td>
+          <td><span class="status">built</span></td>
+          <td>WebRTC Native checkout fetched, synced, patched, and built as <code>out/Wav2Lip/peerconnection_client</code> and <code>out/Wav2Lip/peerconnection_server</code>.</td>
+          <td>Dedicated WebRTC source tree for Wav2Lip receiver experiments. It is separate from trace/replay WebRTC trees.</td>
+        </tr>
+        <tr>
+          <td><code>~/webrtc-wav2lip-native/src/examples/peerconnection/client/conductor.*</code></td>
+          <td><span class="status">patched</span></td>
+          <td>Remote audio tracks are attached to <code>RecentAudioBuffer</code> via <code>AudioTrackSinkInterface</code>; the buffer is passed to the UI renderer.</td>
+          <td>Freeze concealment needs receiver-side audio that continues during video freeze. This gives the Wav2Lip bridge a rolling audio source without touching the trace/replay code.</td>
+        </tr>
+        <tr>
+          <td><code>~/webrtc-wav2lip-native/src/examples/peerconnection/client/linux/main_wnd.*</code></td>
+          <td><span class="status">patched</span></td>
+          <td>Remote video renderer now runs a 20 ms monitor. It starts Wav2Lip generation on a 60 ms render-risk gap, switches to generated frames only after the render deadline is missed for at least 80 ms, refills the generated queue when low, and waits for stable real-frame recovery before returning.</td>
+          <td>This keeps generation ahead of visible stall without switching on every transient low-buffer signal. The implementation is still renderer-local, so packet/frame-buffer causes can be connected later without changing the playback path.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Implementation Notes</h2>
+    <p>
+      The first implementation uses file paths in TCP requests rather than raw
+      frame bytes. This is slower, but it makes failures reproducible because
+      every request has a saved audio file, face image, output path, and CSV log
+      row.
+    </p>
+    <p>
+      When latency becomes the bottleneck, the data path can be replaced with a
+      shared-memory ring buffer while keeping the same policy and state-machine
+      structure.
+    </p>
+    <p>
+      The native receiver can write face frames as PPM because that is simple in
+      C++. The Python Wav2Lip server converts non-JPG/PNG face inputs to PNG
+      before invoking Wav2Lip.
+    </p>
+    <p>
+      The default native TCP endpoint is <code>127.0.0.1:19090</code>, matching
+      <code>run_wav2lip_server.sh</code>. It can be overridden with
+      <code>WEBRTC_WAV2LIP_HOST</code> and <code>WEBRTC_WAV2LIP_PORT</code>.
+    </p>
+    <p>
+      GPU inference is supported through the existing Wav2Lip implementation:
+      <code>inference.py</code> uses CUDA automatically when
+      <code>torch.cuda.is_available()</code> is true. The TCP server now prints
+      <code>gpu_info</code> at startup and supports <code>--require-gpu</code>
+      so experiments do not silently fall back to CPU.
+    </p>
+    <p>
+      The persistent server <code>wav2lip_persistent_server.py</code> keeps the
+      Wav2Lip model and face detector loaded in one GPU process. It avoids
+      per-request Python subprocess startup and checkpoint loading, and it writes
+      generated PPM frames directly instead of going through an MP4 decode path.
+      Startup warm-up is enabled by default so the first concealment request does
+      not pay the initial CUDA/model path cost.
+    </p>
+    <p>
+      Face detection is no longer repeated for every request when the incoming
+      receiver frame shape is unchanged. The persistent server caches the last
+      detected face coordinates and reports <code>face_detect_ms</code> plus
+      <code>face_cache_hit</code> in the CSV log.
+    </p>
+    <p>
+      The receiver audio chunk length is configurable at runtime through
+      <code>WEBRTC_WAV2LIP_AUDIO_CHUNK_MS</code>. This supports online
+      experiments where shorter audio chunks generate shorter video chunks,
+      reducing concealment startup delay. <code>benchmark_persistent_chunks.py</code>
+      measures latency, output duration, and latency/output ratio for multiple
+      chunk sizes against a running persistent server.
+    </p>
+    <p>
+      Online mode now separates audio context from playback hop. Native can push
+      a rolling audio context to the persistent server using
+      <code>WEBRTC_WAV2LIP_STREAM_AUDIO_CONTEXT=1</code>, then trigger
+      <code>generate_tail</code> with <code>WEBRTC_WAV2LIP_TAIL_MS</code>. This
+      avoids waiting for a fresh 500 ms audio file at freeze time; the server
+      already has the latest context and returns only the tail frames needed for
+      playback.
+    </p>
+    <p>
+      The real concealment target uses the last normal remote frame, not a fixed
+      test image. Native now streams that last-good frame to the server during
+      healthy video playback through <code>set_face_context</code>. The server
+      caches the face crop/tensor and can warm the current face+audio path
+      before a freeze occurs. During freeze, <code>generate_tail</code> can use
+      <code>&lt;face_context&gt;</code>, avoiding face-file writes and face
+      detection on the freeze-critical path.
+    </p>
+    <p>
+      Generated-frame playback is now implemented for the native GTK renderer.
+      The Python server extracts generated frames as PPM files; native code loads
+      those frames and plays them at 25 fps while the real remote stream is
+      stalled. Playback is now queue-based rather than a short modulo loop, and
+      native requests the next <code>generate_tail</code> chunk when the queue
+      has at most <code>WEBRTC_WAV2LIP_PREFETCH_THRESHOLD_FRAMES</code>
+      generated frames remaining. With <code>WEBRTC_WAV2LIP_ALWAYS_ON=1</code>,
+      native also refreshes the generated queue during normal real-video
+      playback; later freezes can switch to prepared frames immediately instead
+      of paying the first inference latency at freeze onset. A
+      receiver-side test freeze flag,
+      <code>WEBRTC_WAV2LIP_TEST_FREEZE_AFTER_MS</code>, exists only for local
+      verification; normal runs use real render gaps.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Verification</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Check</th>
+          <th>Result</th>
+          <th>Evidence</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Python syntax</td>
+          <td><span class="status">passed</span></td>
+          <td><code>wav2lip_tcp_server.py</code> and <code>wav2lip_tcp_client.py</code> compiled in the staging tree.</td>
+        </tr>
+        <tr>
+          <td>Shell syntax</td>
+          <td><span class="status">passed</span></td>
+          <td><code>bash -n</code> passed for all lab shell scripts.</td>
+        </tr>
+        <tr>
+          <td>Localhost TCP dry-run</td>
+          <td><span class="status">passed</span></td>
+          <td>Ping and generate requests succeeded on a dry-run server.</td>
+        </tr>
+        <tr>
+          <td>Actual Wav2Lip smoke generation</td>
+          <td><span class="status">passed</span></td>
+          <td>Generated <code>generated_smoke.mp4</code> from a 1 second audio chunk and <code>~/Wav2Lip/me.jpg</code>, then extracted 22 PPM frames. Most recent CPU latency was 4302 ms under <code>~/webrtc-wav2lip-lab/runtime/verify/real_wav2lip_smoke_20260518_121139/</code>.</td>
+        </tr>
+        <tr>
+          <td>Native overlay patcher</td>
+          <td><span class="status">passed</span></td>
+          <td><code>apply_native_overlay.py</code> was tested against the native checkout. It copied native files, patched <code>examples/BUILD.gn</code>, patched receiver integration points, and remained idempotent on a second run.</td>
+        </tr>
+        <tr>
+          <td>Native checkout bootstrap</td>
+          <td><span class="status">passed</span></td>
+          <td><code>~/webrtc-wav2lip-native</code> fetched and synced successfully. The bootstrap default GN args include <code>treat_warnings_as_errors=false</code> to avoid local GCC detection warnings becoming fatal.</td>
+        </tr>
+        <tr>
+          <td>Native WebRTC build</td>
+          <td><span class="status">passed</span></td>
+          <td><code>autoninja -C ~/webrtc-wav2lip-native/src/out/Wav2Lip peerconnection_client peerconnection_server</code> completed successfully after generated-frame playback integration. The remaining GCC 11/12 warning is a local toolchain warning, not an integration compile error.</td>
+        </tr>
+        <tr>
+          <td>Native receiver trigger dry-run</td>
+          <td><span class="status">passed</span></td>
+          <td>Two local WebRTC clients were connected through <code>peerconnection_server</code>, then the sender was stopped to create a receiver render gap. With the Wav2Lip server running in dry-run mode on the default port <code>19090</code>, the receiver generated 4 Wav2Lip requests. Each request wrote <code>last_real_frame.ppm</code>, converted <code>generated.face.png</code>, a 1.000 s <code>recent_audio.wav</code>, and a dry-run output placeholder under <code>~/webrtc-wav2lip-lab/runtime/verify/native_e2e_default_port_20260518_094249/</code>.</td>
+        </tr>
+        <tr>
+          <td>Native generated playback dry-run</td>
+          <td><span class="status">passed</span></td>
+          <td>A local WebRTC run triggered Wav2Lip dry-run generation on <code>127.0.0.1:19090</code>. The server returned <code>frames_dir</code> with 25 PPM frames, and native wrote <code>native_playback_ready.txt</code> confirming those frames were loaded for playback under <code>~/webrtc-wav2lip-lab/runtime/verify/native_generated_playback_20260518_120523/</code>.</td>
+        </tr>
+        <tr>
+          <td>Native real Wav2Lip playback path</td>
+          <td><span class="status">passed</span></td>
+          <td>A local WebRTC run used the real Wav2Lip server instead of dry-run. The request succeeded with 4537 ms CPU latency, produced 22 generated PPM frames, and native wrote <code>native_playback_ready.txt</code> after loading them under <code>~/webrtc-wav2lip-lab/runtime/verify/native_real_generated_playback_20260518_121340/</code>.</td>
+        </tr>
+        <tr>
+          <td>GPU availability and smoke</td>
+          <td><span class="status">passed</span></td>
+          <td>With normal execution permissions, the Wav2Lip conda environment detected <code>NVIDIA GeForce RTX 3090</code>, CUDA 12.1, and <code>torch 2.5.1+cu121</code>. A <code>--require-gpu</code> smoke request completed with 4194 ms latency and 22 extracted PPM frames under <code>~/webrtc-wav2lip-lab/runtime/verify/gpu_wav2lip_smoke_20260518_124052/</code>. The remaining latency is dominated by per-request <code>inference.py</code> subprocess/model startup and media preprocessing, so persistent-model serving is the next optimization target.</td>
+        </tr>
+        <tr>
+          <td>Persistent GPU server smoke</td>
+          <td><span class="status">passed</span></td>
+          <td>The persistent server kept Wav2Lip and the face detector loaded on <code>cuda</code>. With startup warm-up enabled and face bbox caching, request 1 completed in 1096 ms, request 2 in 360 ms, and request 3 in 347 ms for 1 second audio chunks; each produced 22 PPM frames under <code>~/webrtc-wav2lip-lab/runtime/verify/persistent_gpu_facecache_smoke_20260518_130034/</code>. Request 2 and 3 had <code>face_cache_hit=1</code> and <code>face_detect_ms=0</code>.</td>
+        </tr>
+        <tr>
+          <td>Native persistent GPU playback path</td>
+          <td><span class="status">passed</span></td>
+          <td>The native receiver used the persistent GPU server and loaded generated frames successfully. The first receiver-triggered request completed in 1183 ms, with 825 ms preprocessing, 346 ms inference, 12 ms postprocess, and 279 ms face detection under <code>~/webrtc-wav2lip-lab/runtime/verify/native_persistent_gpu_facecache_playback_20260518_130104/</code>.</td>
+        </tr>
+        <tr>
+          <td>Audio chunk latency sweep</td>
+          <td><span class="status">passed</span></td>
+          <td>Against the persistent GPU server, chunk sweep results were: 700 ms audio produced 15 frames / 600 ms output in 296 ms, 500 ms audio produced 10 frames / 400 ms output in 279 ms, and 400 ms audio produced 7 frames / 280 ms output in 225 ms. 300 ms and below produced too little output to keep up, while 150 ms and 100 ms failed due to Wav2Lip input size constraints. Results are under <code>~/webrtc-wav2lip-lab/runtime/verify/chunk_benchmark_20260518_132036/</code>.</td>
+        </tr>
+        <tr>
+          <td>Native 400 ms chunk path</td>
+          <td><span class="status">passed</span></td>
+          <td>With <code>WEBRTC_WAV2LIP_AUDIO_CHUNK_MS=400</code>, the native receiver generated and loaded 7 frames. The first request took 1059 ms because it still paid face detection; model inference itself was 248 ms. Results are under <code>~/webrtc-wav2lip-lab/runtime/verify/native_chunk400_playback_20260518_132135/</code>.</td>
+        </tr>
+        <tr>
+          <td>Sliding audio context + tail generation</td>
+          <td><span class="status">passed</span></td>
+          <td>The persistent server accepted <code>set_audio_context</code> and <code>generate_tail</code>. Steady-state <code>set_audio_context</code> took 0-1 ms, while <code>generate_tail</code> with 500 ms context and 160 ms tail produced 4 frames in 259-277 ms after face cache hit. Native E2E also loaded 4 tail frames under <code>~/webrtc-wav2lip-lab/runtime/verify/native_sliding_tail_20260518_160435/</code>.</td>
+        </tr>
+        <tr>
+          <td>Generated queue prefetch</td>
+          <td><span class="status">passed</span></td>
+          <td>Receiver-side test freeze verified repeated native <code>generate_tail</code> requests. With 160 ms tail chunks, steady latency was about 273-291 ms for 4 frames, so the queue could not hide inference latency. With 400 ms tail chunks and a prefetch threshold of 8 frames, steady requests produced 10 frames in about 284-290 ms after face cache hit and appended successfully, with ready markers showing <code>queue_remaining=13</code>. Results are under <code>~/webrtc-wav2lip-lab/runtime/verify/native_queue_prefetch_tail400_low8_20260518_172022/</code>.</td>
+        </tr>
+        <tr>
+          <td>Render switch policy smoke</td>
+          <td><span class="status">passed</span></td>
+          <td>The native receiver was rebuilt with split risk/switch/return behavior. <code>autoninja -C ~/webrtc-wav2lip-native/src/out/Wav2Lip peerconnection_client</code> succeeded. A local receiver-side test freeze produced 25 <code>generate_tail</code> requests and 49 <code>set_audio_context</code> updates. The first request reason was <code>playout_risk_prefetch</code>, confirming generation started before the later generated-queue refill path. Results are under <code>~/webrtc-wav2lip-lab/runtime/verify/render_switch_policy_smoke_v3/</code>.</td>
+        </tr>
+        <tr>
+          <td>Face context tracking benchmark</td>
+          <td><span class="status">passed</span></td>
+          <td>The persistent server now supports <code>track_face_context</code>, which updates the cached Wav2Lip face crop using OpenCV template matching around the previous crop and falls back to S3FD detection only on tracker failure or forced detection. On the current RTX 3090 prototype with synthetic 1920x1080 rendered frames, S3FD every frame measured request latency p50 105 ms / p95 110 ms, while cheap tracking measured request latency p50 6 ms / p95 6 ms and internal tracking p50 2 ms. Tracking had 0 detector fallbacks over 39 frames with median score 0.9909. A <code>generate_tail</code> smoke test then used <code>&lt;face_context&gt;</code> with <code>face_detect_ms=0</code> and <code>face_cache_hit=true</code>. Results are under <code>/home/widen/webrtc-checkout/analysis_runs/wav2lip_face_tracking_context_1080p_steady/</code> and <code>/home/widen/webrtc-checkout/analysis_runs/wav2lip_face_tracking_context/generate_tail_smoke/</code>.</td>
+        </tr>
+        <tr>
+          <td>Playout headroom prefetch</td>
+          <td><span class="status">implemented</span></td>
+          <td>Added a process-local <code>playout_headroom_signal</code> and <code>scripts/apply_playout_headroom_signal.py</code>. The video stream buffer updates the latest receiver playout headroom, and the GTK renderer can start Wav2Lip generation early when <code>WEBRTC_WAV2LIP_PLAYOUT_HEADROOM_PREFETCH_MS</code> is set. Offline evaluation on original runs with <code>effective_playout_budget.csv</code> showed target coverage improving from 47.2% to 58.7% for the continuous gate subset, while target FP increased from 9.0 s to 16.6 s. The intended use is generation prefetch only; visible switching remains guarded by real render absence and audio/video availability.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+</body>
+</html>
